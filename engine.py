@@ -26,7 +26,7 @@ from typing import Callable, Optional
 from . import nostr, safety
 from .signature import (_SETUP, command_shape, core_shape, first_segment, error_line, fix_id as make_fix_id, normalize,
                         program, program_by_name, segments, shareable, signature, template_step, canonical_step,
-                        masked_failure)
+                        masked_failure, expand_vars)
 from .store import Store
 
 KIND = 30078                       # NIP-78: application-specific data
@@ -166,6 +166,9 @@ class Hive:
     def _process(self, command: str, output: str, returncode: Optional[int], task: str, now: float,
                  live: bool) -> Optional[str]:
         self._last_learned = []
+        if live and returncode not in (0, None):
+            self.settings = Settings.load(self.store)   # `hermes hive network ...` may have changed it meanwhile
+        command = expand_vars(command or "")
         if returncode is None or not (command or "").strip():
             return None
         with self._lock:
@@ -175,7 +178,12 @@ class Hive:
             if returncode != 0:
                 self._resolve_chain(command, output, task, now)
                 return self._on_failure(command, output, task, now, live)
-            self._on_success(command, task, now)
+            parts = segments(command)
+            if len(parts) > 1:               # `fix && retry` in one command: each part ran and succeeded
+                for part in parts:
+                    self._on_success(part, task, now)
+            else:
+                self._on_success(command, task, now)
             return None
 
     def _expire(self, task: str, now: float) -> None:
@@ -229,7 +237,12 @@ class Hive:
                     self._learn(f, f.steps, now, source=self._source)
                 self._open[task].remove(f)
             elif rel == "variant":
-                self._learn(f, f.steps + [command], now, source=self._source)
+                # `datactl sync` after `datactl sync --repair-index` failed: if work was done in between and this
+                # command only drops words, it is the plain retry, and the work in between is the fix
+                if f.steps and _words(command) <= _words(f.command):
+                    self._learn(f, f.steps, now, source=self._source)
+                else:
+                    self._learn(f, f.steps + [command], now, source=self._source)
                 self._open[task].remove(f)
             elif not is_look_around(command) and command not in f.steps:
                 f.steps = (f.steps + [command])[-MAX_STEPS:]
@@ -250,7 +263,7 @@ class Hive:
         changing steps are kept."""
         parts: list[str] = []
         for raw in raw_steps:
-            for seg in segments(raw):
+            for seg in segments(expand_vars(raw)):
                 head = seg.split()[0] if seg.split() else ""
                 if os.path.basename(head) in _SETUP or is_look_around(seg):
                     continue
@@ -261,6 +274,7 @@ class Hive:
         return same if same else parts[-2:]
 
     def _learn(self, f: Failure, raw_steps: list[str], now: float, source: str = "live") -> Optional[Learned]:
+        self.settings = Settings.load(self.store)
         raw_steps = self.essential_steps(f, raw_steps)
         steps = [template_step(s, self.home) for s in raw_steps]
         steps = [s for s in steps if s]
@@ -357,7 +371,9 @@ class Hive:
             lines += [f"    {s}" for s in c["steps"]]
             if c["warn"]:
                 lines.append(f"  ⚠ careful: {', '.join(c['warn'])}")
-        lines.append(f"Hive only suggests; nothing was run. Check it fits before running. (hermes hive show {sig[:10]})")
+        first = cands[0]["steps"]
+        lines.append(f"Suggested next step: run `{' && '.join(first)}`, then retry the command that failed.")
+        lines.append(f"(Hive only suggests; nothing was run. Details: hermes hive show {sig[:10]})")
         return "\n".join(lines), [c["fix_id"] for c in cands]
 
     # ── history ──

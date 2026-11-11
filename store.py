@@ -103,7 +103,9 @@ class Store:
             self._x("DELETE FROM outbox WHERE sig LIKE ?", (sig + "%",))
             return n
         n = self._x("DELETE FROM antibodies").rowcount
-        self._x("DELETE FROM outbox")
+        for table in ("outbox", "votes", "hints", "lookups"):
+            self._x(f"DELETE FROM {table}")
+        self.set_meta("pulled_until", 0)
         return n
 
     # ── network votes ──

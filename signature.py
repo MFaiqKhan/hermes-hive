@@ -52,6 +52,9 @@ def error_line(output: str) -> str:
     for ln in reversed(lines):  # Python: the exception line is the last one of the traceback
         if _PY_EXC.match(ln):
             return ln.strip()
+    for ln in lines:            # "datactl: error: ...", "git: fatal: ..." (before `|| echo "failed"` noise)
+        if _PROG_ERROR.match(ln):
+            return ln.strip()
     for ln in lines:            # tools that print "error:" first and details after
         if _STRONG.search(ln):
             return ln.strip()
@@ -128,6 +131,20 @@ def first_segment(command: str) -> str:
     return re.split(r"\s*\|\s*", segs[-1], maxsplit=1)[0]
 
 
+_ASSIGN = re.compile(r"(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
+
+
+def expand_vars(command: str) -> str:
+    """Put values assigned in the same command back in: `export T=/x/datactl && $T sync` -> `... && /x/datactl sync`."""
+    values = {m.group(1): m.group(2).strip("\"'") for m in _ASSIGN.finditer(command)}
+    if not values:
+        return command
+    def sub(m: re.Match) -> str:
+        name = m.group(1) or m.group(2)
+        return values.get(name, m.group(0))
+    return re.sub(r"\$\{(\w+)\}|\$(\w+)", sub, command)
+
+
 def program(command: str) -> str:
     """The program a command runs: `sudo -E python3 -m pip install x` -> `pip`, `npx tsc` -> `tsc`."""
     toks = _tokens(first_segment(command))
@@ -143,6 +160,9 @@ def program(command: str) -> str:
     if i >= len(toks):
         return ""
     name = os.path.basename(toks[i])
+    sub = re.match(r"^(?:\$\(|`)\s*(?:which|command\s+-v|type\s+-p)\s+([\w.+-]+)", " ".join(toks[i:]))
+    if sub:                              # `$(which datactl) sync` runs datactl
+        return os.path.basename(sub.group(1))
     rest = toks[i + 1:]
     if re.fullmatch(r"python[\d.]*", name) and len(rest) >= 2 and rest[0] == "-m":
         return os.path.basename(rest[1])
@@ -216,7 +236,8 @@ _READERS = {"grep", "egrep", "rg", "ag", "ack", "cat", "bat", "tail", "head", "l
 def masked_failure(command: str, output: str) -> bool:
     """`cmd | tee log`, `cmd | head` or `cmd || true` exit 0 even when cmd failed. True when such a command
     printed a clear error line (the same shapes Hermes's own terminal hints look for)."""
-    pipeline = bool(re.search(r"(?<!\|)\|(?!\|)", command)) or bool(re.search(r"\|\|\s*(true|:|echo\b)", command))
+    pipeline = (bool(re.search(r"(?<!\|)\|(?!\|)", command)) or bool(re.search(r"\|\|\s*(true|:|echo\b)", command))
+                or bool(re.search(r";\s*\S", command)))   # `x; echo "exit $?"`, `x &>log; cat log` exit with the last part
     if not pipeline or program(command) in _READERS:
         return False                       # `grep ERROR app.log | tail` prints error lines from a file: that is data
     lines = [ln for ln in _clean(output).splitlines() if ln.strip()]
@@ -225,6 +246,7 @@ def masked_failure(command: str, output: str) -> bool:
 
 def signature(command: str, output: str) -> tuple[str, str, str]:
     """(signature, program, normalized error) for a failed command."""
+    command = expand_vars(command)
     line = error_line(output)
     m = _SETUP_ERROR.search(line)
     prog = m.group(1) if m else program(command)
@@ -232,8 +254,9 @@ def signature(command: str, output: str) -> tuple[str, str, str]:
     named = re.match(r"\s*([\w.+-]+):\s", line)
     if not m and named:
         progs = {program(p) for seg in segments(command) for p in re.split(r"\s*\|\s*", seg)}
-        if named.group(1) in progs:
-            prog = named.group(1)
+        word = named.group(1)
+        if word in progs or re.search(rf"(?<![\w.-]){re.escape(word)}(?![\w-])", command):
+            prog = word                  # "datactl: error: ..." from `$(which datactl) sync` or `./bin/datactl`
     shape = normalize(line)
     digest = hashlib.sha256(f"{prog}\n{shape}".encode()).hexdigest()[:32]
     return digest, prog, shape
