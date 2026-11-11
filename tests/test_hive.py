@@ -379,7 +379,7 @@ def test_poisoned_fixes_are_not_shown():
                 row = {"sig": sig, "fix_id": sigmod.fix_id(bad), "program": "python", "error": err,
                        "fix": json.dumps(bad), "ok": 9, "fail": 0, "os": "linux"}
                 mock_relay_ev = attacker.build_event(row)
-                __import__("hive.nostr", fromlist=["x"]).publish([url], mock_relay_ev)
+                nostr.publish([url], mock_relay_ev)
         victim = new_hive(network="read", **cfg)
         note = victim.observe("python3 app.py", PY_ERR.format(u="v"), 1, "t")
         assert note is None, note
