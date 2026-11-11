@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# datactl: a tiny stand-in for an internal tool whose error message does not say how to fix it.
+STATE="${HERMES_HOME:-$HOME}/datactl-state"
+case "$1" in
+  --help|-h|help)
+    echo "datactl 2.3 - sync local records"
+    echo "usage: datactl sync | datactl status | datactl cache <verify|rebuild> [--force]"
+    echo "  cache rebuild --force   rebuild the local cache index (needed after an upgrade)";;
+  cache)
+    if [ "$2" = rebuild ] && [ "$3" = --force ]; then mkdir -p "$STATE"; echo ok > "$STATE/index"; echo "cache index rebuilt (1,204 entries)"; exit 0; fi
+    if [ "$2" = rebuild ]; then echo "datactl: refusing to rebuild a live index without --force" >&2; exit 2; fi
+    if [ "$2" = verify ]; then [ -f "$STATE/index" ] && echo "index ok" || { echo "index: bad magic" >&2; exit 3; }; exit 0; fi
+    echo "usage: datactl cache <verify|rebuild> [--force]" >&2; exit 2;;
+  sync|status)
+    if [ ! -f "$STATE/index" ]; then echo "datactl: error: cache index is corrupt or missing (code 17)" >&2; exit 17; fi
+    echo "synced 42 records";;
+  *) echo "usage: datactl sync | status | cache ..." >&2; exit 2;;
+esac

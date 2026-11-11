@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# hv: run the official `hermes` as demo machine A or B, always in a throwaway home under /tmp/hive-video.
+# Your real ~/.hermes is never used: every call sets HERMES_HOME, and chats also get their own HOME.
+#
+#   hv fresh NAME       a plain Hermes home with NO Hive (for before/after tests). Slow once.
+#   hv calls NAME       terminal commands per chat session on that machine (and how many showed a Hive hint)
+#   hv setup            make machines A and B (Hive installed, local model, local relay settings). Slow once.
+#   hv relay            run the local Nostr relay (leave it open in its own terminal tab)
+#   hv A chat           chat on machine A with the terminal tool (also: hv B chat)
+#   hv A hive list      any hermes command on machine A, e.g. hive status | show <sig> | outbox | sync | learn
+#   hv break A          make the demo tool fail again on machine A (deletes only its demo state)
+#   hv clean            stop both machines and delete /tmp/hive-video
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+BASE=${HIVE_VIDEO_DIR:-/tmp/hive-video}
+HERMES=${HERMES_BIN:-$(command -v hermes || echo "$HOME/.local/bin/hermes")}
+MODEL_URL=${MODEL_BASE_URL:-http://127.0.0.1:11435/v1}
+MODEL=${MODEL_NAME:-qwen3.5:4b}
+PORT=${HIVE_RELAY_PORT:-7447}
+export HIVE_MIN_PEERS=${HIVE_MIN_PEERS:-1}     # two demo machines: one other install is enough (default is 2)
+
+h() { local m=$1; shift; HERMES_HOME="$BASE/$m" "$HERMES" "$@" < /dev/null; }
+
+case "${1:-}" in
+  setup)
+    for m in A B; do
+      H="$BASE/$m"
+      [ "$H" != "$HOME/.hermes" ] || { echo "refusing to touch the real Hermes home"; exit 1; }
+      [ -d "$H" ] && { h "$m" gateway stop >/dev/null 2>&1 || true; rm -rf "${H:?}"; }
+      mkdir -p "$H/plugins/hive" "$H/shell-home"; chmod 700 "$H"
+      echo "== machine $m: preparing Hermes (first time takes a few minutes)"
+      h "$m" pm repair > "$BASE/setup-$m.log" 2>&1 || { echo "pm repair failed, see $BASE/setup-$m.log"; exit 1; }
+      cp "$HERE"/../*.py "$HERE"/../plugin.yaml "$HERE"/../README.md "$H/plugins/hive/"
+      h "$m" plugins enable hive >> "$BASE/setup-$m.log" 2>&1
+      h "$m" config set model.provider custom > /dev/null
+      h "$m" config set model.base_url "$MODEL_URL" > /dev/null
+      h "$m" config set model.default "$MODEL" > /dev/null
+      h "$m" hive relays "ws://127.0.0.1:$PORT" > /dev/null
+    done
+    h A hive network share > /dev/null
+    h B hive network read > /dev/null
+    echo "Ready: machine A shares fixes, machine B reads them. Relay: ws://127.0.0.1:$PORT (start it with: hv relay)";;
+  fresh)
+    m=${2:?name}; H="$BASE/$m"
+    [ "$H" != "$HOME/.hermes" ] || { echo "refusing to touch the real Hermes home"; exit 1; }
+    [ -d "$H" ] && { h "$m" gateway stop >/dev/null 2>&1 || true; rm -rf "${H:?}"; }
+    mkdir -p "$H/shell-home"; chmod 700 "$H"
+    echo "== $m: preparing a plain Hermes home without Hive (first time takes a few minutes)"
+    h "$m" pm repair > "$BASE/setup-$m.log" 2>&1 || { echo "pm repair failed, see $BASE/setup-$m.log"; exit 1; }
+    h "$m" config set model.provider custom > /dev/null
+    h "$m" config set model.base_url "$MODEL_URL" > /dev/null
+    h "$m" config set model.default "$MODEL" > /dev/null
+    echo "Ready: $BASE/$m (no plugins). Chat with: hv $m chat";;
+  calls)
+    m=${2:?name}
+    python3 - "$BASE/$m/state.db" <<'PY'
+import sqlite3, sys, time
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+rows = db.execute("SELECT id, started_at FROM sessions ORDER BY started_at").fetchall()
+for n, (sid, started) in enumerate(rows, 1):
+    msgs = db.execute("SELECT content FROM messages WHERE session_id=? AND role='tool' AND tool_name='terminal'",
+                      (sid,)).fetchall()
+    if not msgs:
+        continue
+    hints = sum("Hive: this error has been fixed before" in (c or "") for (c,) in msgs)
+    when = time.strftime("%H:%M", time.localtime(started)) if isinstance(started, (int, float)) else str(started)[11:16]
+    print(f"chat {n} ({when}): {len(msgs)} terminal commands" + (f", Hive hint shown {hints}x" if hints else ""))
+PY
+    ;;
+  relay)
+    PY=$(ls -d "$BASE"/A/installs/*/pm-runtime/generations/*/bin/python 2>/dev/null | head -1)
+    exec "${PY:-python3}" "$HERE/mock_relay.py" "$PORT";;
+  break)
+    m=${2:?A or B}; rm -rf "${BASE:?}/$m/datactl-state" "${BASE:?}/$m/shell-home/datactl-state"
+    echo "machine $m: datactl is broken again (cache index missing)";;
+  clean)
+    for d in "$BASE"/*/; do [ -f "$d/config.yaml" ] && h "$(basename "$d")" gateway stop >/dev/null 2>&1 || true; done
+    rm -rf "${BASE:?}"; echo "removed $BASE";;
+  [A-Za-z0-9_-]*)
+    m=$1; shift
+    [ -d "$BASE/$m" ] || { echo "no machine $m yet: run hv setup (A and B) or hv fresh $m"; exit 1; }
+    if [ "${1:-}" = chat ]; then
+      shift
+      HERMES_HOME="$BASE/$m" HOME="$BASE/$m/shell-home" PATH="$HERE/demo:$PATH" \
+        exec "$HERMES" chat -t terminal --reasoning none "$@"
+    fi
+    HERMES_HOME="$BASE/$m" exec "$HERMES" "$@";;
+  *) sed -n "2,14p" "$0"; exit 1;;
+esac
