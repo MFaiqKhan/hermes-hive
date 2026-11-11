@@ -33,6 +33,7 @@ def new_hive(**settings):
     h = engine.Hive(d, home=f"/home/u{os.getpid()}")
     for k, v in settings.items():
         setattr(h.settings, k, v)
+    h.settings.save(h.store)            # Hive re-reads saved settings, like `hermes hive network ...` writes them
     return h
 
 
@@ -195,6 +196,48 @@ def test_before_after_run_pipes_and_chains():
     # reading a log that contains error lines is not a failure
     assert not sigmod.masked_failure("grep ERROR app.log | tail -5", "ERROR: disk full")
     assert sigmod.masked_failure("python3 app.py | tee out.log", PY_ERR.format(u="x"))
+    assert sigmod.masked_failure('datactl sync 2>&1; echo "Exit code: $?"', err + "\nExit code: 17")
+
+
+def test_tool_called_through_which_or_a_path_matches():
+    err = "datactl: error: cache index is corrupt or missing (code 17)"
+    base = sigmod.signature("datactl sync", err)[0]
+    assert sigmod.signature("cd /x/demo && $(which datactl) sync 2>&1", err)[0] == base
+    assert sigmod.signature("`which datactl` sync", err)[0] == base
+    assert sigmod.signature("./datactl sync", err)[0] == base
+    assert sigmod.program("$(which datactl) sync") == "datactl"
+
+
+def test_fix_and_retry_in_one_command_and_semicolon_masking():
+    err = "datactl: error: cache index is corrupt or missing (code 17)"
+    # machine A in the video run: six tries, then `fix && retry` in one command
+    h = new_hive()
+    h.observe("datactl sync", err, 17, "t")
+    h.observe("datactl sync --repair-index", err, 17, "t")
+    h.observe("datactl --help 2>&1 | head -30", "usage", 0, "t")
+    h.observe("datactl cache rebuild --force && datactl sync", "cache index rebuilt\nsynced 42 records", 0, "t")
+    assert [json.loads(r["fix"]) for r in h.store.all_antibodies()] == [["datactl cache rebuild --force"]], \
+        [dict(r) for r in h.store.all_antibodies()]
+    # machine B: `x &>log; cat log` exits 0 although x failed; the hint must still appear
+    note = h.observe("datactl sync &>/tmp/b/log; cat /tmp/b/log", err, 0, "t2")
+    assert note and "datactl cache rebuild --force" in note, note
+
+
+def test_third_video_run_echo_noise_and_variables():
+    err = "datactl: error: cache index is corrupt or missing (code 17)"
+    base = sigmod.signature("datactl sync", err)[0]
+    # machine A: `|| echo "Sync failed"` added a second, vaguer error line
+    assert sigmod.signature('datactl sync && echo "Sync complete" || echo "Sync failed or not installed"',
+                            err + "\nSync failed or not installed")[0] == base
+    # machine B: the tool through a variable set in the same command
+    t = "/mnt/x/hive/tests/demo/datactl"
+    assert sigmod.signature(f'cd /mnt/x && export DATACTL_EXE="{t}" && $DATACTL_EXE sync', err)[0] == base
+    h = new_hive()
+    h.observe(f'export DATACTL_EXE="{t}" && $DATACTL_EXE sync', err, 17, "t")
+    h.observe(f'export DATACTL_EXE="{t}" && $DATACTL_EXE cache rebuild --force', "rebuilt", 0, "t")
+    h.observe(f'export DATACTL_EXE="{t}" && $DATACTL_EXE sync', "synced 42 records", 0, "t")
+    assert [json.loads(r["fix"]) for r in h.store.all_antibodies()] == [["datactl cache rebuild --force"]], \
+        [dict(r) for r in h.store.all_antibodies()]
 
 
 def test_plain_retry_learns_nothing():
@@ -316,6 +359,7 @@ def test_three_installs_share_a_fix_over_a_relay():
         b.publish_pending()
         # C sees two independent installs
         c.settings.min_peers = 2
+        c.settings.save(c.store)
         note = c.observe("python3 app.py", PY_ERR.format(u="c"), 1, "t")
         assert note and "2 other Hermes installs" in note, note
         assert len(relay.events) == 2
