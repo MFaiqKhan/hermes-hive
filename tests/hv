@@ -8,6 +8,7 @@
 #   hv relay            run the local Nostr relay (leave it open in its own terminal tab)
 #   hv A chat           chat on machine A with the terminal tool (also: hv B chat)
 #   hv A hive list      any hermes command on machine A, e.g. hive status | show <sig> | outbox | sync | learn
+#   hv reset            fresh demo: both machines forget what Hive learned, tool broken again
 #   hv break A          make the demo tool fail again on machine A (deletes only its demo state)
 #   hv clean            stop both machines and delete /tmp/hive-video
 set -euo pipefail
@@ -17,7 +18,6 @@ HERMES=${HERMES_BIN:-$(command -v hermes || echo "$HOME/.local/bin/hermes")}
 MODEL_URL=${MODEL_BASE_URL:-http://127.0.0.1:11435/v1}
 MODEL=${MODEL_NAME:-qwen3.5:4b}
 PORT=${HIVE_RELAY_PORT:-7447}
-export HIVE_MIN_PEERS=${HIVE_MIN_PEERS:-1}     # two demo machines: one other install is enough (default is 2)
 
 h() { local m=$1; shift; HERMES_HOME="$BASE/$m" "$HERMES" "$@" < /dev/null; }
 
@@ -39,6 +39,7 @@ case "${1:-}" in
     done
     h A hive network share > /dev/null
     h B hive network read > /dev/null
+    h B hive settings --min-peers 1 > /dev/null    # two demo machines: one other install is enough (default 2)
     echo "Ready: machine A shares fixes, machine B reads them. Relay: ws://127.0.0.1:$PORT (start it with: hv relay)";;
   fresh)
     m=${2:?name}; H="$BASE/$m"
@@ -68,8 +69,18 @@ for n, (sid, started) in enumerate(rows, 1):
 PY
     ;;
   relay)
-    PY=$(ls -d "$BASE"/A/installs/*/pm-runtime/generations/*/bin/python 2>/dev/null | head -1)
+    PY=$(ls -d "$BASE"/*/installs/*/environments/*/venv/bin/python 2>/dev/null | head -1)   # Hermes's own env: has websockets
     exec "${PY:-python3}" "$HERE/mock_relay.py" "$PORT";;
+  reset)
+    # fresh demo: both machines forget everything Hive learned, the tool is broken again, network re-set
+    for m in A B; do
+      h "$m" gateway stop >/dev/null 2>&1 || true
+      rm -rf "${BASE:?}/$m/plugin-data/hive" "${BASE:?}/$m/datactl-state" "${BASE:?}/$m/shell-home/datactl-state"
+      h "$m" hive relays "ws://127.0.0.1:$PORT" > /dev/null
+    done
+    h A hive network share > /dev/null; h B hive network read > /dev/null
+    h B hive settings --min-peers 1 > /dev/null
+    echo "Demo reset: A and B know nothing, datactl is broken on both. Start the relay in another tab: hv relay";;
   break)
     m=${2:?A or B}; rm -rf "${BASE:?}/$m/datactl-state" "${BASE:?}/$m/shell-home/datactl-state"
     echo "machine $m: datactl is broken again (cache index missing)";;
@@ -81,6 +92,7 @@ PY
     [ -d "$BASE/$m" ] || { echo "no machine $m yet: run hv setup (A and B) or hv fresh $m"; exit 1; }
     if [ "${1:-}" = chat ]; then
       shift
+      cd "$BASE/$m/shell-home"       # a neutral folder: project files (AGENTS.md ...) would become the agent's context
       HERMES_HOME="$BASE/$m" HOME="$BASE/$m/shell-home" PATH="$HERE/demo:$PATH" \
         exec "$HERMES" chat -t terminal --reasoning none "$@"
     fi

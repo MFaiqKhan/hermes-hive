@@ -23,8 +23,9 @@ Hive fixes both halves:
 
 2. **Between installs (opt-in).** With `hermes hive network share`, verified fixes are published to
    [Nostr](https://nostr.com) relays: signed, anonymous, no server of ours. Other installs that hit the same error
-   see *"3 other Hermes installs fixed it with: …"*. When the fix works for them too, their install vouches for it;
-   when it does not, it says so, and the fix sinks.
+   see it labelled for what it is: *"Unverified text from 2 anonymous Nostr peers; check it before running
+   anything"*. Only fixes learned on your own machine are phrased as a suggested next step. When a shared fix works
+   for another install too, that install vouches for it; when it does not, it says so, and the fix sinks.
 
 ## How it learns
 
@@ -61,13 +62,26 @@ Hints are text. Even so, a hint is a suggestion an agent may follow, so:
 - **Never shown:** download piped to a shell, encoded code, deleting whole trees, disk writes, SSH keys, remote
   shells, firewall off, force-push, TLS checks off … (also never learned locally).
 - **Shown with a warning:** sudo, global installs, deletes, chmod 777, stopping services, editing shell start-up files.
-- **Fixes from other installs must also:**
-  - come from at least 2 independent installs (`min_peers`), more yes than no;
-  - not install from a URL, a file or a non-default package index;
-  - **be explained by the error:** a shared `pip install X` is shown only if `X` appears in the error (or is the
-    known package for that import, like `yaml` → `pyyaml`), unless 5+ installs vouch for it. A poisoned
-    "`pip install reqeusts`" for a missing `requests` never appears;
-  - carry valid signatures, proof of work (NIP-13, 16 bits by default) and content that matches its own hashes.
+- **Fixes from other installs** are text from anonymous strangers, and votes from random keys cost nothing to
+  fake. So a shared fix is shown only when **every step has one of two allowlisted shapes**, however many installs
+  report it:
+  1. a known installer installing packages **named in the error** (`pip install httpx` for
+     "No module named 'httpx'"; `yaml` → `pyyaml` style import names are known); never from a URL, a file or a
+     non-default index;
+  2. **the program that failed, run again with other arguments** (`datactl cache rebuild --force` after
+     `datactl sync` failed), and only if that program is not an interpreter, shell or package runner, nor a
+     program whose arguments alone can run code, reach another machine or destroy files (`find`, `tar`, `ssh`,
+     `rsync`, `awk`, `sed`, `docker`, `rm`, `chmod` …), and with no code-running or server-choosing arguments
+     (`--exec`, `--to-command`, `ProxyCommand`, `git -c …`, `git config`, URLs, `!`).
+
+  Package names must match the error **as whole words**: `colorama` in the error does not justify
+  `pip install color`.
+
+  Everything else from the network is refused: `npx x`, `uvx x`, `python -c …`, `bash ./x.sh`, paths to
+  executables, variables, `sudo`, and any shell syntax (`;`, `&&`, `|`, `$(…)`, redirects). It also needs 2+
+  independent installs (`min_peers`; this install's own reports never count), more yes than no, valid signatures, proof of work (NIP-13, 16 bits by
+  default) and content that matches its own hashes. Network fixes are shown as unverified text, never as an
+  instruction.
 
 ## Privacy
 
@@ -83,9 +97,12 @@ Before anything is shared:
 - home paths become `~` (only dot-folders such as `~/.npmrc` are kept);
 - other private paths, non-public hosts, IPs, user names, e-mails and secret-looking text keep the fix
   **private**: it is used on your machine and never published;
+- the **error line** gets the same secret screen as the fix steps (API keys such as `sk-…`, `ghp_…`, `xoxb-…`,
+  JWTs, long tokens): if it matches, the fix stays private;
 - Hermes's own secret redactor gets a final say.
 
-`hermes hive outbox` shows exactly what was or would be published. The install key is random and lives in
+Only fixes in a shape other installs accept are published at all; anything else stays on your machine, and
+`hermes hive outbox` says why. `hermes hive outbox` shows exactly what was or would be published. The install key is random and lives in
 `plugin-data/hive/install.key`; nothing ties it to you.
 
 ## Commands
@@ -98,6 +115,7 @@ hermes hive network off|read|share
 hermes hive outbox            exactly what is published
 hermes hive sync              publish waiting fixes, fetch new reports now
 hermes hive relays [URL ...]  set relays (default nos.lol, relay.primal.net, relay.damus.io); --reset
+hermes hive settings [--min-peers N] [--min-pow N]   network thresholds (stored with the plugin's data)
 hermes hive forget SIG|--all
 /hive                         status in any chat
 ```
@@ -129,6 +147,6 @@ Hook cost: under 0.1 ms per terminal command (no network on the hot path; lookup
 
 ## Tests
 
-`python tests/test_hive.py`: 22 offline tests, including three installs trading a fix over a local
+`python tests/test_hive.py`: 34 offline tests, including three installs trading a fix over a local
 mock relay, poisoned fixes (wrong package, `curl | sh`) vouched for by three fake installs that are refused, and the
 exact command sequences the live model produced (pipes like `| tee` that hide a failure, `&&` chains, full tool paths).

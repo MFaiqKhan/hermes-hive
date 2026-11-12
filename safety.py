@@ -118,12 +118,70 @@ _IMPORT_TO_PACKAGE = {
 }
 
 
+def _error_words(error: str) -> set[str]:
+    """Normalized words of an error line; dotted names also count by each part (`yaml.constructor` -> yaml)."""
+    words = set()
+    for w in re.findall(r"[A-Za-z0-9@][A-Za-z0-9._/@-]*", error):
+        for part in [w] + re.split(r"[./]", w):
+            n = _norm_pkg(part)
+            if n:
+                words.add(n)
+    return words
+
+
 def justified_by_error(step: str, error: str) -> bool:
-    """True when every package a step installs is named in the error (or the step installs nothing)."""
+    """True when every package a step installs is named in the error as a whole word (or is the known package
+    for an import named there), or the step installs nothing. `colorama` in the error does not justify `color`."""
     names = install_targets(step)
     if not names:
         return True
-    err = re.sub(r"[-_.]+", "", error.lower())
-    mapped = {pkg for imp, pkg in _IMPORT_TO_PACKAGE.items()
-              if re.search(rf"(?<![a-z0-9]){imp}(?![a-z0-9])", error.lower())}
-    return all(_norm_pkg(n) and (_norm_pkg(n) in err or _norm_pkg(n) in mapped) for n in names)
+    words = _error_words(error)
+    mapped = {pkg for imp, pkg in _IMPORT_TO_PACKAGE.items() if imp in words}
+    return all(_norm_pkg(n) and (_norm_pkg(n) in words or _norm_pkg(n) in mapped) for n in names)
+
+
+# ── what a fix from the network may look like ────────────────────────────────────────────────────────────────
+# Anything an anonymous peer could use to run its own code is out, whatever the votes: interpreters and package
+# runners (python -c, node -e, npx x, uvx x, bash ./x.sh ...), and any shell syntax beyond one plain command.
+_RUNNERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php", "lua", "bash", "sh", "zsh", "fish",
+            "dash", "ksh", "pwsh", "powershell", "npx", "pnpx", "bunx", "uvx", "pipx", "uv", "curl", "wget", "eval",
+            "exec", "source", ".", "sudo", "doas", "env", "xargs", "nohup", "osascript", "cmd"}
+_SHELL_SYNTAX = re.compile(r"[;&|`<>]|\$\(|\$\{|\n")
+# Programs whose arguments alone can run code, reach other machines or destroy files: a stranger's "same program,
+# other flags" is never accepted for them.
+_POWERFUL = {"ssh", "scp", "sftp", "rsync", "find", "awk", "gawk", "mawk", "nawk", "sed", "make", "cmake",
+             "docker", "podman", "kubectl", "helm", "systemctl", "crontab", "rm", "rmdir", "mv", "cp", "dd", "ln",
+             "chmod", "chown", "chgrp", "truncate", "shred", "mount", "umount", "tee", "install", "at",
+             "nc", "ncat", "socat", "telnet", "ftp", "tftp", "scutil", "launchctl", "reg", "schtasks", "gdb", "strace"}
+# Arguments that make an ordinary program run something else or talk to a chosen server.
+_EXEC_ARG = re.compile(r"(?i)(?:^|\s)--?(?:exec(?:dir)?|eval|command|to-command|rsh|upload-pack|receive-pack|"
+                       r"entrypoint|checkpoint-action|use-compress-program|run|shell|hook|plugin|preload|script)"
+                       r"(?:[=\s]|$)|proxycommand|localcommand|sshcommand|\bcore\.|\balias\.|!|://|"
+                       r"\bLD_PRELOAD\b|\bPYTHONPATH\b|\bNODE_OPTIONS\b")
+
+
+def network_step_allowed(step: str, error: str, failed_program: str) -> bool:
+    """True only for the two shapes a shared fix may take:
+    1. a known installer installing packages named in the error (`pip install httpx` for "No module named httpx");
+    2. the program that failed, run again with other arguments (`datactl cache rebuild --force` after
+       `datactl sync` failed), when that program is not an interpreter, shell or package runner."""
+    if not step or _SHELL_SYNTAX.search(step):
+        return False
+    try:
+        toks = shlex.split(step)
+    except ValueError:
+        return False
+    if not toks or "/" in toks[0] or re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]):
+        return False
+    if install_targets(step):
+        return justified_by_error(step, error) and not _PKG_URL.search(step)
+    head = toks[0]
+    from .signature import program as _program
+    prog = _program(step)
+    if not failed_program or prog != failed_program or head != prog:
+        return False
+    if prog in _RUNNERS or prog in _POWERFUL or _EXEC_ARG.search(step):
+        return False
+    if prog == "git" and re.search(r"(?:^|\s)(?:-c|config|submodule\s+foreach|--config-env)(?:\s|=|$)", step):
+        return False                     # `git -c core.x=...` / `git config` can make git run anything
+    return True

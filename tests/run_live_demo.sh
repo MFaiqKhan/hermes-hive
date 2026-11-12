@@ -66,7 +66,7 @@ echo "== machine-A: what Hive learned"
 HERMES_HOME="$A" hermes hive list < /dev/null | sed 's/^/   /'
 HERMES_HOME="$A" hermes hive sync < /dev/null | sed 's/^/   /'
 
-export HIVE_MIN_PEERS=1          # one other install is enough for this two-machine demo (default 2)
+HERMES_HOME="$B" hermes hive settings --min-peers 1 < /dev/null > /dev/null   # two machines: one other install is enough (default 2)
 run_chat "$B" machine-B
 echo "== machine-B: the hint the agent saw"
 python3 - "$B/state.db" <<'PY' | sed 's/^/   /'

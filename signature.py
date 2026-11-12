@@ -303,7 +303,7 @@ def shareable(step: str) -> tuple[bool, str]:
     """May this (templated) fix step leave the machine? (ok, reason when not)."""
     if "<PATH>" in step:
         return False, "mentions a private path"
-    if _SECRETISH.search(step):
+    if _SECRETISH.search(step) or _TOKEN.search(step):
         return False, "looks like it carries a secret"
     for host in re.findall(r"[a-z][a-z0-9+.-]*://([^/\s:'\"]+)", step, re.I):
         h = host.lower()
@@ -316,6 +316,24 @@ def shareable(step: str) -> tuple[bool, str]:
         if redact_for_egress(step) != step:
             return False, "Hermes's redactor found a secret"
     except Exception:  # noqa: BLE001 - outside Hermes or a changed API: our own patterns above still apply
+        pass
+    return True, ""
+
+
+_TOKEN = re.compile(r"\b(?:sk|pk|rk)-\S{6,}|\bgh[pousr]_\S{6,}|\bgithub_pat_|\bxox[abprse]-|\bAKIA\S{8,}|"
+                    r"\bAIza\S{10,}|\beyJ\S{8,}\.\S{8,}|\bglpat-|\bhf_\S{10,}|\bnpm_\S{10,}|"
+                    r"\b[A-Za-z0-9+/_-]{40,}\b")   # prefixes survive normalization (`xoxb-<N>-<N>-...`)
+
+
+def error_shareable(error: str) -> tuple[bool, str]:
+    """May this (normalized) error line leave the machine? The same secret screen as fix steps."""
+    if _TOKEN.search(error) or _SECRETISH.search(error):
+        return False, "the error line looks like it carries a secret"
+    try:
+        from agent.redact import redact_for_egress  # Hermes's own secret patterns (private module, guarded)
+        if redact_for_egress(error) != error:
+            return False, "Hermes's redactor found a secret in the error line"
+    except Exception:  # noqa: BLE001
         pass
     return True, ""
 

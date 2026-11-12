@@ -123,6 +123,9 @@ class Store:
     def votes(self, sig: str) -> list[sqlite3.Row]:
         return self.rows("SELECT * FROM votes WHERE sig=?", (sig,))
 
+    def drop_votes_from(self, pubkey: str) -> None:
+        self._x("DELETE FROM votes WHERE pubkey=?", (pubkey,))
+
     def vote_count(self) -> tuple[int, int]:
         r = self.rows("SELECT COUNT(DISTINCT pubkey) AS k, COUNT(DISTINCT sig) AS s FROM votes")[0]
         return r["k"], r["s"]

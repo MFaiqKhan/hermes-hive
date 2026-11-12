@@ -25,8 +25,8 @@ from typing import Callable, Optional
 
 from . import nostr, safety
 from .signature import (_SETUP, command_shape, core_shape, first_segment, error_line, fix_id as make_fix_id, normalize,
-                        program, program_by_name, segments, shareable, signature, template_step, canonical_step,
-                        masked_failure, expand_vars)
+                        program, program_by_name, segments, shareable, error_shareable, signature, template_step,
+                        canonical_step, masked_failure, expand_vars)
 from .store import Store
 
 KIND = 30078                       # NIP-78: application-specific data
@@ -75,6 +75,16 @@ def related(cmd: str, failed_cmd: str) -> str:
     return ""
 
 
+def failed_part(command: str, prog: str) -> str:
+    """The part of a command list that failed: in `cat notes && export X=1 && datactl sync` the error came from
+    datactl, so the failure is `datactl sync`. Keeping the whole list would make a later `cat other-file` look
+    like a successful retry of it."""
+    parts = segments(command)
+    if len(parts) < 2 or not prog:
+        return command
+    return next((p for p in reversed(parts) if program(p) == prog), command)
+
+
 @dataclass
 class Failure:
     sig: str
@@ -100,34 +110,27 @@ class Learned:
 
 @dataclass
 class Settings:
+    """Stored in the plugin's own SQLite file and changed with `hermes hive network|relays|settings`."""
     network: str = "off"                    # off | read | share
     relays: list = field(default_factory=lambda: list(DEFAULT_RELAYS))
     min_pow: int = 16
     min_peers: int = 2
-    strong_peers: int = 5
     lookup_timeout: float = 2.5
     lookup_every: float = 3600.0
+
+    FIELDS = ("network", "relays", "min_pow", "min_peers", "lookup_timeout", "lookup_every")
 
     @classmethod
     def load(cls, store: Store) -> "Settings":
         s = cls()
         saved = store.get_meta("settings", {}) or {}
         for k, v in saved.items():
-            if hasattr(s, k):
+            if k in cls.FIELDS:
                 setattr(s, k, v)
-        env = os.environ.get("HIVE_RELAYS")
-        if env:
-            s.relays = [r.strip() for r in env.split(",") if r.strip()]
-        if os.environ.get("HIVE_MIN_POW"):
-            s.min_pow = int(os.environ["HIVE_MIN_POW"])
-        if os.environ.get("HIVE_MIN_PEERS"):
-            s.min_peers = int(os.environ["HIVE_MIN_PEERS"])
         return s
 
     def save(self, store: Store) -> None:
-        store.set_meta("settings", {k: getattr(self, k) for k in
-                                    ("network", "relays", "min_pow", "min_peers", "strong_peers",
-                                     "lookup_timeout", "lookup_every")})
+        store.set_meta("settings", {k: getattr(self, k) for k in self.FIELDS})
 
 
 class Hive:
@@ -215,6 +218,7 @@ class Hive:
                 for fid in f.hinted:
                     self._record_fail(sig, fid, prog, shape)
                 f.hinted = []
+        command = failed_part(command, prog)
         existing = next((f for f in self._open[task] if f.sig == sig), None)
         if existing:
             existing.at, existing.command = now, command
@@ -284,7 +288,10 @@ class Hive:
         if "block" in verdicts:
             return None                      # never keep a dangerous "fix", even locally
         fid = make_fix_id(steps)
-        checks = [shareable(s) for s in steps]
+        checks = [shareable(s) for s in steps] + [error_shareable(f.error)]
+        if all(c[0] for c in checks) and not all(safety.network_step_allowed(s, f.error, f.program) for s in steps):
+            checks.append((False, "it is not a shape other installs accept (an install named in the error, or "
+                                  "the same program with other arguments)"))
         ok_share = all(c[0] for c in checks)
         note = next((c[1] for c in checks if not c[0]), "")
         new = self.store.learn(f.sig, fid, f.program, f.error, steps, source=source, os_name=self.os_name,
@@ -303,15 +310,17 @@ class Hive:
         else:
             steps = self._fix_steps(sig, fid)
             if steps:
+                ok_share = (all(shareable(s)[0] for s in steps) and error_shareable(shape)[0]
+                            and all(safety.network_step_allowed(s, shape, prog) for s in steps))
                 self.store.learn(sig, fid, prog, shape, steps, source="hive", os_name=self.os_name,
-                                 shareable=all(shareable(s)[0] for s in steps), share_note="", ok=0)
+                                 shareable=ok_share, share_note="", ok=0)
                 self.store.outcome(sig, fid, worked=False)
         if self.settings.network == "share" and self.store.antibody(sig, fid)["shareable"]:
             self.store.queue(sig, fid)
             self._kick_sync()
 
     # ── hints ──
-    def candidates(self, sig: str, error: str) -> list[dict]:
+    def candidates(self, sig: str, error: str, prog: str = "") -> list[dict]:
         out = []
         for r in self.store.local_fixes(sig):
             if r["ok"] <= r["fail"]:
@@ -340,8 +349,9 @@ class Hive:
                 verdicts = [safety.screen(s, "network") for s in g["steps"]]
                 if any(v[0] == "block" for v in verdicts):
                     continue
-                if g["yes"] < self.settings.strong_peers and not all(
-                        safety.justified_by_error(s, error) for s in g["steps"]):
+                # Votes cost nothing to fake, so they never vouch for a shape on their own: every step must be
+                # an allowlisted shape tied to this error, however many installs report it.
+                if not all(safety.network_step_allowed(s, error, prog) for s in g["steps"]):
                     continue
                 out.append({"fix_id": fid, "steps": g["steps"], "origin": "network", "peers": g["yes"],
                             "against": g["no"], "warn": sorted({w for v in verdicts for w in v[1]})})
@@ -355,7 +365,7 @@ class Hive:
                 self.lookup(sig, timeout=self.settings.lookup_timeout)
             except Exception:  # noqa: BLE001 - the network is a bonus; a failure never blocks the agent
                 pass
-        cands = self.candidates(sig, error)
+        cands = self.candidates(sig, error, prog)
         if not cands:
             return None, []
         lines = ["", "── Hive: this error has been fixed before ──"]
@@ -366,13 +376,14 @@ class Hive:
                 lines.append(f"• On this machine (worked {times}, last {when}):")
             else:
                 against = f", {c['against']} said it did not" if c.get("against") else ""
-                who = "1 other Hermes install" if c["peers"] == 1 else f"{c['peers']} other Hermes installs"
-                lines.append(f"• {who} fixed it with{against}:")
+                who = "1 anonymous Nostr peer" if c["peers"] == 1 else f"{c['peers']} anonymous Nostr peers"
+                lines.append(f"• Unverified text from {who}{against}; check it before running anything:")
             lines += [f"    {s}" for s in c["steps"]]
             if c["warn"]:
                 lines.append(f"  ⚠ careful: {', '.join(c['warn'])}")
-        first = cands[0]["steps"]
-        lines.append(f"Suggested next step: run `{' && '.join(first)}`, then retry the command that failed.")
+        if cands[0]["origin"] == "local":
+            first = cands[0]["steps"]
+            lines.append(f"Suggested next step: run `{' && '.join(first)}`, then retry the command that failed.")
         lines.append(f"(Hive only suggests; nothing was run. Details: hermes hive show {sig[:10]})")
         return "\n".join(lines), [c["fix_id"] for c in cands]
 
@@ -422,10 +433,25 @@ class Hive:
         return nostr.make_event(self.key, KIND, tags, json.dumps(content, separators=(",", ":")),
                                 pow_bits=self.settings.min_pow)
 
-    def accept_event(self, ev: dict) -> bool:
-        """Validate one event from a relay and store it as a vote. False when it is not a valid Hive event."""
+    def _own_pubkey(self) -> str:
+        """This install's key, if it has one (an install without a key never published anything)."""
+        if self._key is None and not (self.data_dir / "install.key").exists():
+            return ""
+        return self._safe_pubkey()
+
+    def _forget_own_reports(self) -> str:
+        own = self._own_pubkey()
+        if own:
+            self.store.drop_votes_from(own)          # rows stored by earlier versions, which kept them
+        return own
+
+    def accept_event(self, ev: dict, own: Optional[str] = None) -> bool:
+        """Validate one event from a relay and store it as a vote. False when it is not a valid Hive event, or when
+        it is this install's own report coming back from a relay (it is not another install's evidence)."""
         try:
             if ev.get("kind") != KIND or not nostr.verify_event(ev, min_pow=self.settings.min_pow):
+                return False
+            if ev.get("pubkey") == (self._own_pubkey() if own is None else own):
                 return False
             d = next((t[1] for t in ev["tags"] if t and t[0] == "d"), "")
             c = json.loads(ev["content"])
@@ -452,7 +478,8 @@ class Hive:
         events, _errors = nostr.query(self.settings.relays, {"kinds": [KIND], "#t": [f"hh-{sig}"], "limit": 200},
                                       timeout=timeout)
         self.store.mark_lookup(sig)
-        return sum(1 for ev in events if self.accept_event(ev))
+        own = self._forget_own_reports()
+        return sum(1 for ev in events if self.accept_event(ev, own))
 
     def publish_pending(self, limit: int = 20) -> list[dict]:
         results = []
@@ -473,7 +500,8 @@ class Hive:
         if since:
             flt["since"] = max(0, since - 600)
         events, _errors = nostr.query(self.settings.relays, flt, timeout=timeout)
-        n = sum(1 for ev in events if self.accept_event(ev))
+        own = self._forget_own_reports()
+        n = sum(1 for ev in events if self.accept_event(ev, own))
         self.store.set_meta("pulled_until", int(time.time()))
         return n
 

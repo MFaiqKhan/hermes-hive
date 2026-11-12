@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from . import safety
 from .engine import DEFAULT_RELAYS, Hive
 
 _HIVE: Optional[Hive] = None
@@ -66,12 +67,14 @@ def status_text() -> str:
     local = [a for a in abs_ if a["ok"] > a["fail"]]
     keys, sigs = h.store.vote_count()
     pend = [r for r in h.store.outbox_rows() if not r["published_at"]]
-    lines = [f"Hive: {len(local)} fixes learned on this machine ({len(abs_)} recorded)."]
+    def n(k, word, plural=None):
+        return f"{k} {word if k == 1 else (plural or word + 's')}"
+    lines = [f"Hive: {n(len(local), 'fix', 'fixes')} learned on this machine ({len(abs_)} recorded)."]
     net = h.settings.network
     if net == "off":
         lines.append("Network: off (fixes stay on this machine). Turn on with: hermes hive network read|share")
     else:
-        lines.append(f"Network: {net}. {keys} other installs seen, sharing fixes for {sigs} errors. "
+        lines.append(f"Network: {net}. {n(keys, 'other install')} seen, sharing fixes for {n(sigs, 'error')}. "
                      f"Relays: {', '.join(h.settings.relays)}")
         if net == "share":
             lines.append(f"Waiting to publish: {len(pend)}. Your install key: {h.pubkey[:16]}… (random, not you)")
@@ -82,6 +85,12 @@ def status_text() -> str:
             lines.append(f"  {a['sig'][:10]}  {a['program']}: {a['error'][:70]}\n      fix: {fix[:110]}  "
                          f"(worked {a['ok']}x)")
     return "\n".join(lines)
+
+
+def _reason(note: Optional[str]) -> str:
+    """A share note as a sentence: "mentions a private path" -> "it mentions a private path"."""
+    note = note or "mentions private details"
+    return note if note.startswith(("the ", "it ", "Hermes")) else "it " + note
 
 
 def _show(sig: str) -> str:
@@ -99,13 +108,26 @@ def _show(sig: str) -> str:
                    f"({a['source']}); share: {'yes' if a['shareable'] else 'no - ' + (a['share_note'] or '')}")
         out += [f"    {s}" for s in json.loads(a["fix"])]
     by_fix: dict[str, list] = {}
+    mine = h._safe_pubkey()
     for v in votes:
-        by_fix.setdefault(v["fix_id"], []).append(v)
+        if v["pubkey"] != mine:
+            by_fix.setdefault(v["fix_id"], []).append(v)
+    refused = 0
     for fid, vs in by_fix.items():
+        steps = json.loads(vs[0]["fix"])
+        # The hint points agents here, so text Hive would not show in a hint is not shown here either.
+        if any(safety.screen(s, "network")[0] == "block" for s in steps) or \
+                not all(safety.network_step_allowed(s, vs[0]["error"], prog) for s in steps):
+            refused += len(vs)
+            continue
         yes = sum(1 for v in vs if v["ok"] > v["fail"])
         no = sum(1 for v in vs if v["fail"] >= v["ok"] and v["fail"] > 0)
-        out.append(f"\nOther installs: {yes} say it works, {no} say it does not")
-        out += [f"    {s}" for s in json.loads(vs[0]["fix"])]
+        out.append(f"\nUnverified text from anonymous Nostr peers ({yes} say it works, {no} say it does not); "
+                   f"check it before running anything:")
+        out += [f"    {s}" for s in steps]
+    if refused:
+        out.append(f"\nRefused: {refused} report{'s' if refused != 1 else ''} from anonymous peers with commands in a "
+                   f"shape Hive does not accept from the network (not shown).")
     return "\n".join(out)
 
 
@@ -127,6 +149,9 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
     p = sub.add_parser("relays", help="Show or set the Nostr relays")
     p.add_argument("urls", nargs="*")
     p.add_argument("--reset", action="store_true")
+    p = sub.add_parser("settings", help="Show or change network settings")
+    p.add_argument("--min-peers", type=int, help="independent installs a shared fix needs before it is shown (default 2)")
+    p.add_argument("--min-pow", type=int, help="proof-of-work bits required on shared fixes (default 16)")
     p = sub.add_parser("forget", help="Delete learned fixes (one signature prefix, or --all)")
     p.add_argument("sig", nargs="?")
     p.add_argument("--all", action="store_true")
@@ -148,7 +173,8 @@ def _handle_cli(args: argparse.Namespace) -> int:
             print(json.dumps(rep))
         else:
             pct = (100 * rep["repeat_known"] / rep["failures"]) if rep["failures"] else 0
-            print(f"Read {rep['commands']} terminal commands in {rep['sessions']} sessions (read-only).")
+            print(f"Read {rep['commands']} terminal command{'s' if rep['commands'] != 1 else ''} in {rep['sessions']} "
+                  f"session{'s' if rep['sessions'] != 1 else ''} (read-only).")
             print(f"Failures: {rep['failures']}. Fixes learned: {rep['learned']} ({rep['new']} new).")
             print(f"Failures of an error seen before: {rep['repeat_failures']}; of an error already fixed before: "
                   f"{rep['repeat_known']} ({pct:.0f}% of all failures). Hive would have pointed to the fix.")
@@ -185,8 +211,9 @@ def _handle_cli(args: argparse.Namespace) -> int:
                               "os": r["os"]}, ensure_ascii=False))
         private = [a for a in h.store.all_antibodies() if not a["shareable"]]
         if private:
-            print(f"\nKept private (never published): {len(private)} fixes, e.g. because they "
-                  f"{private[0]['share_note'] or 'mention private details'}.")
+            print(f"\nKept private (never published): {len(private)} fix{'es' if len(private) != 1 else ''}. "
+                  f"Reason{' for the first' if len(private) != 1 else ''}: "
+                  f"{_reason(private[0]['share_note'])}.")
     elif cmd == "sync":
         if h.settings.network == "off":
             print("Network is off. Turn on with: hermes hive network read|share")
@@ -203,6 +230,13 @@ def _handle_cli(args: argparse.Namespace) -> int:
             h.settings.relays = [u if u.startswith("ws") else f"wss://{u}" for u in args.urls]
         h.settings.save(h.store)
         print("Relays:", ", ".join(h.settings.relays))
+    elif cmd == "settings":
+        if args.min_peers is not None:
+            h.settings.min_peers = max(1, args.min_peers)
+        if args.min_pow is not None:
+            h.settings.min_pow = max(0, args.min_pow)
+        h.settings.save(h.store)
+        print(json.dumps({k: getattr(h.settings, k) for k in h.settings.FIELDS}, indent=2))
     elif cmd == "forget":
         if not args.sig and not args.all:
             print("Give a signature prefix or --all")
