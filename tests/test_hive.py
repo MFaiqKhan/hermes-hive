@@ -530,6 +530,37 @@ def test_review_secret_in_error_line_keeps_fix_private():
     assert all("secret" in r["share_note"] for r in rows)
 
 
+def test_hermes_redactor_is_called_through_the_public_api():
+    """The last secret check uses `agent.redact:redact_sensitive_text` (published plugin API), and a
+    secret only Hermes's redactor knows keeps the error line and the fix private."""
+    import types
+    src = Path(sigmod.__file__).read_text()
+    assert "redact_for_egress" not in src and "from agent.redact import redact_sensitive_text" in src
+    calls = []
+
+    def fake(text, *, force=False, redact_url_credentials=False, **kw):
+        calls.append((force, redact_url_credentials))
+        return text.replace("zqvault", "***")
+    saved = {k: sys.modules.get(k) for k in ("agent", "agent.redact")}
+    pkg, mod = types.ModuleType("agent"), types.ModuleType("agent.redact")
+    mod.redact_sensitive_text, pkg.redact = fake, mod
+    sys.modules.update({"agent": pkg, "agent.redact": mod})
+    try:
+        assert sigmod.shareable("tool unlock zqvault")[0] is False
+        assert sigmod.error_shareable("tool: error: bad zqvault")[0] is False
+        assert sigmod.shareable("tool cache rebuild --force") == (True, "")
+        assert calls and all(c == (True, True) for c in calls)        # force: the mode for text leaving
+        mod.redact_sensitive_text = lambda *a, **k: 1 / 0               # a changed API never blocks our own checks
+        assert sigmod.shareable("tool cache rebuild --force") == (True, "")
+        assert sigmod.error_shareable("tool: error: token sk-proj-AbCdEf0123456789 bad")[0] is False
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def test_review_settings_live_in_the_plugin_store_not_env():
     os.environ["HIVE_MIN_PEERS"] = "1"
     try:
