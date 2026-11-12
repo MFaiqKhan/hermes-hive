@@ -311,13 +311,20 @@ def shareable(step: str) -> tuple[bool, str]:
             return False, f"uses a non-public host ({h})"
     if _IPV4.search(step) or _USERHOST.search(step) or _EMAIL.search(step):
         return False, "names a machine or a person"
-    try:
-        from agent.redact import redact_for_egress  # Hermes's own secret patterns (private module, guarded)
-        if redact_for_egress(step) != step:
-            return False, "Hermes's redactor found a secret"
-    except Exception:  # noqa: BLE001 - outside Hermes or a changed API: our own patterns above still apply
-        pass
+    if hermes_finds_secret(step):
+        return False, "Hermes's redactor found a secret"
     return True, ""
+
+
+def hermes_finds_secret(text: str) -> bool:
+    """Hermes's own secret patterns as a last check, through the published plugin API
+    (`agent.redact:redact_sensitive_text`; force=True is the mode for text that must never leave).
+    Outside Hermes, or if the call fails, Hive's own patterns still apply."""
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True) != text
+    except Exception:  # noqa: BLE001
+        return False
 
 
 _TOKEN = re.compile(r"\b(?:sk|pk|rk)-\S{6,}|\bgh[pousr]_\S{6,}|\bgithub_pat_|\bxox[abprse]-|\bAKIA\S{8,}|"
@@ -329,12 +336,8 @@ def error_shareable(error: str) -> tuple[bool, str]:
     """May this (normalized) error line leave the machine? The same secret screen as fix steps."""
     if _TOKEN.search(error) or _SECRETISH.search(error):
         return False, "the error line looks like it carries a secret"
-    try:
-        from agent.redact import redact_for_egress  # Hermes's own secret patterns (private module, guarded)
-        if redact_for_egress(error) != error:
-            return False, "Hermes's redactor found a secret in the error line"
-    except Exception:  # noqa: BLE001
-        pass
+    if hermes_finds_secret(error):
+        return False, "Hermes's redactor found a secret in the error line"
     return True, ""
 
 
