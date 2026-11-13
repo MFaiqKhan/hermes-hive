@@ -489,6 +489,10 @@ class Hive:
                 return False
             if len(err) > 300 or d != f"{D_PREFIX}{sig}/{fid}":
                 return False
+            if any(safety.has_hidden_chars(x) for x in [prog, err, *fix]):
+                return False                 # text that would show differently from what it says
+            if any(safety.has_hidden_chars(t[1] if len(t) > 1 else "") for t in ev.get("tags", []) if t):
+                return False
             import hashlib
             if hashlib.sha256(f"{prog}\n{err}".encode()).hexdigest()[:32] != sig or make_fix_id(fix) != fid:
                 return False                 # content must match the hashes it claims

@@ -72,10 +72,31 @@ def screen(step: str, origin: str = "local") -> tuple[str, list[str]]:
     return ("warn" if warns else "ok"), warns
 
 
+# ── program names ─────────────────────────────────────────────────────────────────────────────────────────────
+
+def base_name(prog: str) -> str:
+    """The program a name stands for, for every rule below: `NPM.CMD` -> npm, `python3.12` -> python,
+    `node18` -> node, `Git.exe` -> git. Rules keyed by program never miss a Windows or versioned spelling."""
+    name = (prog or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    name = re.sub(r"\.(exe|cmd|bat|ps1|com)$", "", name)
+    stripped = re.sub(r"[\d.]+$", "", name)
+    return stripped or name
+
+
+# Characters that make shown text differ from what a terminal runs, or redraw the screen: control characters
+# (carriage return, escape, NUL, backspace ...), invisible format characters (zero-width, bidi overrides, BOM) and
+# any space other than the plain one. Text from the network carrying any of them is never stored or shown.
+_HIDDEN = re.compile("[\x00-\x1f\x7f-\x9f\u00a0\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ufeff\ufff9-\ufffb]")
+
+
+def has_hidden_chars(text: str) -> bool:
+    return bool(_HIDDEN.search(text or ""))
+
+
 # ── is a shared install explained by the error? ───────────────────────────────────────────────────────────────
 
 _INSTALLERS = {
-    ("pip", "install"), ("pip3", "install"), ("uv", "add"), ("pipx", "install"), ("poetry", "add"),
+    ("pip", "install"), ("uv", "add"), ("pipx", "install"), ("poetry", "add"),
     ("npm", "install"), ("npm", "i"), ("npm", "add"), ("pnpm", "add"), ("pnpm", "install"), ("yarn", "add"),
     ("apt", "install"), ("apt-get", "install"), ("dnf", "install"), ("yum", "install"), ("pacman", "-S"),
     ("brew", "install"), ("cargo", "install"), ("cargo", "add"), ("gem", "install"), ("go", "install"),
@@ -83,26 +104,33 @@ _INSTALLERS = {
 }
 
 
-def install_targets(step: str) -> list[str]:
-    """Package names a step installs (empty when it is not an install)."""
+def _installer_tokens(step: str) -> list[str]:
+    """The step's tokens from the installer on (`sudo python3 -m pip install x` -> pip install x), or []."""
     try:
         toks = shlex.split(step)
     except ValueError:
         toks = step.split()
     toks = [t for t in toks if t not in ("sudo", "doas")]
-    if len(toks) >= 3 and re.fullmatch(r"python[\d.]*", toks[0]) and toks[1] == "-m":
+    if len(toks) >= 3 and base_name(toks[0]) == "python" and toks[1] == "-m":
         toks = toks[2:]
-    if toks[:2] == ["uv", "pip"]:
+    if len(toks) >= 2 and base_name(toks[0]) == "uv" and toks[1] == "pip":
         toks = toks[1:]
-    if len(toks) < 3 or (toks[0], toks[1]) not in _INSTALLERS:
+    if len(toks) < 3 or (base_name(toks[0]), toks[1]) not in _INSTALLERS:
         return []
+    return [base_name(toks[0])] + toks[1:]
+
+
+def install_targets(step: str) -> list[str]:
+    """Package names a step installs (empty when it is not an install)."""
+    toks = _installer_tokens(step)
     names = []
     for t in toks[2:]:
         if t.startswith("-") or t in ("install", "add"):
             continue
-        name = re.split(r"[<>=!~;\[@ ]", t, maxsplit=1)[0]
-        if name.startswith("@") and "/" in t:     # npm scoped package: @scope/name@version
+        if t.startswith("@") and "/" in t:         # npm scoped package: @scope/name@version
             name = "@" + t[1:].split("@")[0]
+        else:
+            name = re.split(r"[<>=!~;\[@ ]", t, maxsplit=1)[0]
         if name and not name.startswith("<"):
             names.append(name.lower())
     return names
@@ -133,54 +161,149 @@ def _error_words(error: str) -> set[str]:
     return words
 
 
+def _error_tokens(error: str) -> set[str]:
+    """The error's words exactly as written (case aside), for names that must appear verbatim."""
+    return {t.strip(".,:;").lower() for t in re.split(r"[\s'\"`()\[\]{}<>]+", error or "") if t.strip(".,:;")}
+
+
+# What a package name may look like in a fix from the network. A name is a registry name and nothing else: no
+# alias (`foo@npm:evil`), no git host or shorthand (`user/repo`, `github:x/y`), no path, file, tarball, URL or
+# protocol (`./foo`, `file:`, `link:`, `workspace:`, `portal:`). Versions are plain version text.
+_VER = r"[A-Za-z0-9.*+^~_-]+"
+_PY_SPEC = r"(?:===|==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]+"
+_NAME_SHAPES = {
+    "npm": re.compile(rf"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(?:@{_VER})?"),
+    "pip": re.compile(rf"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?(?:{_PY_SPEC}(?:,{_PY_SPEC})*)?"),
+    "go": re.compile(rf"[a-z0-9][a-z0-9.-]*(?:/[A-Za-z0-9._~-]+)+(?:@{_VER})?"),
+    "brew": re.compile(r"[a-z0-9][a-z0-9@._+-]*"),
+    "other": re.compile(rf"[A-Za-z0-9][A-Za-z0-9._+-]*(?:[=@]{_VER})?"),
+}
+_FAMILY = {"npm": "npm", "pnpm": "npm", "yarn": "npm", "pip": "pip", "pipx": "pip", "uv": "pip", "poetry": "pip",
+           "go": "go", "brew": "brew"}
+# Flags an install from the network may carry: switches that do not choose where code comes from or where it
+# goes. Anything else (an index, registry, source, path, git URL, target, prefix, config, workspace, channel,
+# requirements or constraints file, editable install ...) is refused, including every short option not listed.
+_INSTALL_FLAGS = {
+    "--upgrade", "--user", "--pre", "--no-deps", "--no-cache-dir", "--force-reinstall", "--quiet", "--verbose",
+    "--save", "--save-dev", "--save-exact", "--save-optional", "--save-prod", "--save-peer", "--no-save",
+    "--legacy-peer-deps", "--force", "--global", "--ignore-scripts", "--no-audit", "--no-fund", "--dev", "--exact",
+    "--optional", "--peer", "--locked", "--frozen", "--offline", "--yes", "--assume-yes",
+    "--no-install-recommends", "--fix-missing", "--fix-broken", "--reinstall", "--only-upgrade", "--needed",
+    "--break-system-packages", "--cask", "--formula", "--build-from-source",
+    "-y", "-q", "-v", "-U", "-D", "-E", "-S", "-g", "-P", "-O", "-B",
+}
+
+
+def _name_of(token: str, family: str) -> str:
+    """The bare package name of a validated token: version, extras and specifiers dropped."""
+    if family == "npm" and token.startswith("@"):
+        return "@" + token[1:].split("@", 1)[0]
+    if family == "go":
+        return token.split("@", 1)[0]
+    return re.split(r"[<>=!~\[@]", token, maxsplit=1)[0]
+
+
+def _named_by_error(name: str, error: str) -> bool:
+    """A plain name must be a whole word of the error (or the known package for an import named there). A name
+    with a scope or a path (`@acme/foo`, `github.com/acme/foo`, a tap) must appear in the error exactly, so
+    `attacker/foo` or `evil.example/foo` never pass because the error mentions `foo`."""
+    if "/" in name:
+        return name.lower() in _error_tokens(error)
+    words = _error_words(error)
+    mapped = {pkg for imp, pkg in _IMPORT_TO_PACKAGE.items() if imp in words}
+    n = _norm_pkg(name)
+    return bool(n) and (n in words or n in mapped)
+
+
 def justified_by_error(step: str, error: str) -> bool:
     """True when every package a step installs is named in the error as a whole word (or is the known package
     for an import named there), or the step installs nothing. `colorama` in the error does not justify `color`."""
-    names = install_targets(step)
-    if not names:
+    toks = _installer_tokens(step)
+    if not toks:
         return True
-    words = _error_words(error)
-    mapped = {pkg for imp, pkg in _IMPORT_TO_PACKAGE.items() if imp in words}
-    return all(_norm_pkg(n) and (_norm_pkg(n) in words or _norm_pkg(n) in mapped) for n in names)
+    family = _FAMILY.get(toks[0], "other")
+    names = [t for t in toks[2:] if not t.startswith("-")]
+    return bool(names) and all(_NAME_SHAPES[family].fullmatch(t) and _named_by_error(_name_of(t, family), error)
+                               for t in names)
 
 
 # ── what a fix from the network may look like ────────────────────────────────────────────────────────────────
 # Anything an anonymous peer could use to run its own code is out, whatever the votes: interpreters and package
 # runners (python -c, node -e, npx x, uvx x, bash ./x.sh ...), and any shell syntax beyond one plain command.
-_RUNNERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php", "lua", "bash", "sh", "zsh", "fish",
-            "dash", "ksh", "pwsh", "powershell", "npx", "pnpx", "bunx", "uvx", "pipx", "uv", "curl", "wget", "eval",
-            "exec", "source", ".", "sudo", "doas", "env", "xargs", "nohup", "osascript", "cmd"}
+_RUNNERS = {"python", "node", "nodejs", "deno", "bun", "ruby", "perl", "php", "lua", "luajit", "bash", "sh", "zsh",
+            "fish", "dash", "ksh", "csh", "tcsh", "pwsh", "powershell", "npx", "pnpx", "bunx", "uvx", "pipx", "uv",
+            "curl", "wget", "eval", "exec", "source", ".", "sudo", "doas", "env", "xargs", "nohup", "osascript",
+            "cmd", "java", "dotnet-script", "tsx", "ts-node", "rscript", "julia", "groovy", "scala", "kotlin",
+            "elixir", "erl", "swift"}
 _SHELL_SYNTAX = re.compile(r"[;&|`<>]|\$\(|\$\{|\n")
-# Programs whose arguments alone can run code, reach other machines or destroy files: never accepted from a
-# stranger, not even as "your own command plus a flag".
+# Programs whose arguments alone can run code, reach other machines, destroy files or change remote
+# infrastructure: never accepted from a stranger, not even as "your own command plus a flag".
 _POWERFUL = {"ssh", "scp", "sftp", "rsync", "find", "awk", "gawk", "mawk", "nawk", "sed", "make", "cmake",
              "docker", "podman", "kubectl", "helm", "systemctl", "crontab", "rm", "rmdir", "mv", "cp", "dd", "ln",
              "chmod", "chown", "chgrp", "truncate", "shred", "mount", "umount", "tee", "install", "at",
-             "nc", "ncat", "socat", "telnet", "ftp", "tftp", "scutil", "launchctl", "reg", "schtasks", "gdb", "strace"}
+             "nc", "ncat", "socat", "telnet", "ftp", "tftp", "scutil", "launchctl", "reg", "schtasks", "gdb", "strace",
+             # archivers: many options run a program (tar -I/-F/--to-command, zip -TT)
+             "tar", "bsdtar", "gtar", "zip", "unzip", "7z", "7za", "rar", "unrar", "cpio",
+             # pagers and editors can run shell commands or load scripts from the folder
+             "man", "less", "more", "most", "vi", "vim", "nvim", "view", "emacs", "nano", "ed", "ex",
+             # database clients run statements
+             "psql", "mysql", "mariadb", "mongo", "mongosh", "redis-cli", "sqlite", "sqlcmd", "clickhouse-client",
+             # cloud, deploy and infrastructure tools change remote systems
+             "terraform", "tofu", "terragrunt", "pulumi", "gcloud", "gsutil", "bq", "aws", "az", "ansible",
+             "ansible-playbook", "flyctl", "fly", "heroku", "vercel", "netlify", "firebase", "wrangler", "gh", "glab",
+             "doctl", "oc", "eksctl", "serverless", "sls", "cdk", "sam", "packer", "vagrant", "nomad", "consul",
+             "vault", "kustomize", "skaffold", "tilt", "railway", "supabase"}
 # Arguments that make an ordinary program run something else or talk to a chosen server.
 _EXEC_ARG = re.compile(r"(?i)(?:^|\s)--?(?:exec(?:dir)?|eval|command|to-command|rsh|upload-pack|receive-pack|"
                        r"entrypoint|checkpoint-action|use-compress-program|run|shell|hook|plugin|preload|script)"
                        r"(?:[=\s]|$)|proxycommand|localcommand|sshcommand|\bcore\.|\balias\.|!|://|"
                        r"\bLD_PRELOAD\b|\bPYTHONPATH\b|\bNODE_OPTIONS\b")
 
-# A flag a stranger may add: a plain switch (`--force`, `--legacy-peer-deps`, `-y`, `-fdx`), or a long switch with
-# a number (`--jobs=1`, `--retries=3`). Nothing that could NAME something (a package, file, host, URL, statement:
-# `--package=evil`, `--registry=evil.example`, `--config=x.toml`, `--strict-ssl=false`), and no long word glued to
-# a single dash (`mysql -eshutdown`, `psql -cvacuum`).
-_PLAIN_FLAG = re.compile(r"--[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*(?:=\d+(?:\.\d+)*)?|-[A-Za-z0-9]{1,3}")
-# An extra screen on top of that shape, not the guarantee: switches whose name says they turn off a transport,
-# signature, sandbox or permission check, or let more code run (`--insecure`, `--no-verify`, `--nogpgcheck`,
-# `--gpgcheck=0`, `--no-sandbox`, `--allow-root`, `--unsafe-perm`, `--dangerously-allow-all-builds`).
-_WEAKENS = re.compile(r"(?i)ssl|tls|cert|verif|gpg|sign|sandbox|checksum|integrity|hash|secure|trust|auth|root|"
-                      r"priv|unsafe|allow|danger|script|downgrade|force-yes|^-k$")
+# A flag a stranger may add to the user's own command: a single-letter switch (`-v`) or a lowercase long switch
+# (`--force`, `--legacy-peer-deps`), optionally with a small number (`--jobs=1`, `--timeout=2.5`). Never a value
+# that could name something (`--registry=evil.example`, `--config=x.toml`, `--strict-ssl=false`, `--x=1.2.3.4`),
+# never a short option with text glued to it (`tar -Ish`, `man -Psh`, `mysql -eshutdown`).
+_PLAIN_FLAG = re.compile(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:=\d+(?:\.\d+)?)?|-[A-Za-z0-9]")
+# Words in a switch's name that turn off a transport, signature, sandbox or permission check, change who owns or
+# may write files, let more code run, or open a debugger. Matched against the dash-separated parts of the name, so
+# `--unshallow` is not mistaken for `allow`.
+_WEAK_WORDS = {"ssl", "tls", "cert", "certs", "certificate", "certificates", "insecure", "k", "verify", "noverify",
+               "verification", "gpg", "gpgcheck", "nogpgcheck", "sign", "signed", "signature", "signatures",
+               "unsigned", "sandbox", "checksum", "checksums", "integrity", "hash", "hashes", "secure", "trust",
+               "trusted", "untrusted", "auth", "unauthenticated", "root", "privileged", "unsafe", "allow", "allowed",
+               "danger", "dangerous", "dangerously", "script", "scripts", "downgrade", "downgrades", "perm", "perms",
+               "permission", "permissions", "umask", "uid", "gid", "mode", "chmod", "chown", "owner", "setuid",
+               "inspect", "inspector", "debug", "debugger", "remote", "listen", "bind", "expose", "public"}
+# Words for switches that throw work away or skip a confirmation that guards something destructive.
+_DESTRUCTIVE_WORDS = {"hard", "purge", "wipe", "destroy", "delete", "drop", "prune", "overwrite", "clobber",
+                      "truncate", "recursive", "erase", "nuke", "discard", "yes", "approve", "noconfirm", "mirror",
+                      "lease", "reset", "remove", "rm", "y"}
+_SKIP_WORDS = {"no", "skip", "without", "disable", "ignore"}
+_GIT_SHORT_DESTRUCTIVE = {"-f", "-D", "-d", "-x", "-X", "-r", "-R", "-y"}
+
+
+def _flag_refused(flag: str, prog: str) -> bool:
+    """True for a plain flag that a stranger may still not add: it weakens a check, destroys, or skips a prompt."""
+    name = flag.lstrip("-").split("=", 1)[0].lower()
+    parts = set(name.split("-"))
+    if parts & _WEAK_WORDS or parts & _DESTRUCTIVE_WORDS:
+        return True
+    if parts & {"confirm", "confirmation", "preview", "prompt", "interactive", "verify", "check", "checks"} \
+            and parts & _SKIP_WORDS:
+        return True
+    if prog == "git" and (flag in _GIT_SHORT_DESTRUCTIVE or "force" in parts):
+        return True
+    return False
+
+
 # Subcommands that fetch or run code (the list from the catalog review, plus aliases and close relatives): never
-# accepted as the subcommand of a network step, whatever the program.
+# accepted in a network step, whatever the program.
 _FETCH_RUN = {"exec", "x", "dlx", "create", "init", "run", "run-script", "start", "test", "download", "wheel",
               "stop", "restart", "t", "tst", "it", "cit", "install-test", "install-ci-test", "rum", "urn", "generate",
               "tool", "bench", "script", "serve", "dev", "watch", "eval", "repl", "shell", "console", "publish"}
 # Package managers and build tools run code under many names (`cargo build` runs build scripts, `mvn exec:java`),
 # so for them only a short list of dependency-maintenance subcommands may be repeated with a new flag.
-_PKG_TOOLS = {"npm", "pnpm", "yarn", "bun", "corepack", "pip", "pip3", "pipenv", "poetry", "pdm", "hatch", "conda",
+_PKG_TOOLS = {"npm", "pnpm", "yarn", "bun", "corepack", "pip", "pipenv", "poetry", "pdm", "hatch", "conda",
               "mamba", "micromamba", "go", "cargo", "rustup", "gem", "bundle", "bundler", "composer", "dotnet",
               "nuget", "mvn", "mvnw", "gradle", "gradlew", "ant", "sbt", "lein", "mix", "stack", "cabal", "swift",
               "flutter", "dart", "pod", "brew", "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "snap",
@@ -202,12 +325,15 @@ def _split(command: str) -> list[str]:
         return []
 
 
-def _install_shape(step: str, toks: list[str], error: str) -> bool:
-    """Shape 1: a known installer installing only packages the error names, with nothing but plain flags."""
-    if not justified_by_error(step, error) or _PKG_URL.search(step):
+def _install_shape(step: str, error: str) -> bool:
+    """Shape 1: a known installer installing only registry packages the error names, with only flags that do not
+    choose a source, target or config (`_INSTALL_FLAGS`)."""
+    toks = _installer_tokens(step)
+    if not toks or _PKG_URL.search(step):
         return False
-    flags = [t for t in toks if t.startswith("-")]
-    return all(_PLAIN_FLAG.fullmatch(t) and not _WEAKENS.search(t) for t in flags)
+    if not all(t in _INSTALL_FLAGS for t in toks[2:] if t.startswith("-")):
+        return False
+    return justified_by_error(step, error)
 
 
 def _own_command_plus_flags(toks: list[str], failed_command: str) -> bool:
@@ -220,10 +346,11 @@ def _own_command_plus_flags(toks: list[str], failed_command: str) -> bool:
     prog = _program(failed_command) if own else ""
     if not own or not prog or own[0] != prog or toks[:len(own)] != own:
         return False
-    if prog in _RUNNERS or prog in _POWERFUL:
+    base = base_name(prog)
+    if base in _RUNNERS or base in _POWERFUL:
         return False
     added = toks[len(own):]
-    if not all(_PLAIN_FLAG.fullmatch(t) and not _WEAKENS.search(t) for t in added):
+    if not all(_PLAIN_FLAG.fullmatch(t) and not _flag_refused(t, base) for t in added):
         return False
     if "--" in own or "-" in own:
         return False                     # after a bare `--` an added "flag" would be an argument
@@ -231,7 +358,7 @@ def _own_command_plus_flags(toks: list[str], failed_command: str) -> bool:
     sub = words[0] if words else ""
     if any(w in _FETCH_RUN for w in words):
         return False                     # `npm exec x --yes`, `go -C dir run . -v`: not from a stranger
-    if prog in _PKG_TOOLS and sub not in (_ALWAYS_BUILTIN if prog in _SCRIPT_BY_ANY_NAME else _MAINTENANCE):
+    if base in _PKG_TOOLS and sub not in (_ALWAYS_BUILTIN if base in _SCRIPT_BY_ANY_NAME else _MAINTENANCE):
         return False                     # `yarn build`, `cargo build`, `mvn exec:java`: they run code
     return True
 
@@ -239,24 +366,28 @@ def _own_command_plus_flags(toks: list[str], failed_command: str) -> bool:
 def network_step_allowed(step: str, error: str, failed_command: str = "") -> bool:
     """True only for the two shapes a fix from another install may take, however many installs report it:
 
-    1. a known installer installing packages named in the error (`pip install httpx` for "No module named httpx");
+    1. a known installer installing registry packages the error names (`pip install httpx` for "No module named
+       httpx"), with no alias, git host, path, file, URL, index, registry, source or target;
     2. the command that failed on this machine, token for token, with plain flags added at the end
        (`npm install --legacy-peer-deps` after `npm install` failed; `datactl sync --rebuild-index` after
-       `datactl sync` failed). Never for interpreters, shells, runners or tools whose flags alone can do harm,
-       never for fetch-and-run subcommands (`exec`, `run`, `dlx`, `create` ...), and for package managers and
-       build tools only for dependency-maintenance subcommands (`install`, `update`, `ci`, `cache` ...).
+       `datactl sync` failed). Never for interpreters, shells, runners, archivers, editors, database clients,
+       cloud and deploy tools or programs whose flags alone can do harm; never for fetch-and-run subcommands
+       (`exec`, `run`, `dlx`, `create` ...); for package managers and build tools only for dependency-maintenance
+       subcommands; never a flag that weakens a check, destroys work or skips a confirmation.
 
-    `failed_command` is the local failure as peers would write it (see `engine.network_shape`). Without it (no
-    such failure recorded on this machine) only shape 1 can pass."""
-    if not step or _SHELL_SYNTAX.search(step):
+    Program names are compared by what they stand for (`npm.cmd`, `Git.exe`, `python3.12`). Text with control,
+    invisible or non-plain space characters is refused. `failed_command` is the local failure as peers would write
+    it (see `engine.network_shape`); without it (no such failure recorded here) only shape 1 can pass."""
+    if not step or has_hidden_chars(step) or _SHELL_SYNTAX.search(step):
         return False
     toks = _split(step)
-    if not toks or "/" in toks[0] or re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]):
+    if not toks or "/" in toks[0] or "\\" in toks[0] or re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]):
         return False
     if install_targets(step):
-        return _install_shape(step, toks, error)
+        return _install_shape(step, error)   # an install with no package (`npm install --x`) is the shape-2 case
     if _EXEC_ARG.search(step):
         return False
-    if toks[0] == "git" and re.search(r"(?:^|\s)(?:-c|config|submodule\s+foreach|--config-env)(?:\s|=|$)", step):
+    if base_name(toks[0]) == "git" and \
+            re.search(r"(?:^|\s)(?:-c|config|submodule\s+foreach|--config-env)(?:\s|=|$)", step):
         return False                     # `git -c core.x=...` / `git config` can make git run anything
     return bool(failed_command) and _own_command_plus_flags(toks, failed_command)

@@ -164,8 +164,18 @@ Hook cost: under 0.1 ms per terminal command (no network on the hot path; lookup
 
 ## Tests
 
-`python tests/test_hive.py`: 41 offline tests, including three installs trading a fix over a local
+`python tests/test_hive.py`: 41 offline tests, and `python tests/test_attacks.py`: 16 adversarial test groups
+(see below). The offline tests include three installs trading a fix over a local
 mock relay, poisoned fixes (wrong package, `curl | sh`) vouched for by three fake installs that are refused, two
 fake peers offering `npm exec <pkg>` / `go run <mod>@latest` after an npm / go failure (nothing is shown), a table
 of fetch-and-run commands for 20+ package managers and build tools, and the exact command sequences the live model
 produced (pipes like `| tee` that hide a failure, `&&` chains, full tool paths).
+
+`tests/test_attacks.py` attacks the network rules the way a stranger would: installs that name the right package but
+fetch from somewhere else (npm aliases `foo@npm:evil`, `user/repo` and `github:` shorthands, brew taps, other Go
+modules with the same last name, paths, tarballs, `-e`/`-r`/`--index-url`/`--registry`/`--git`/`--path`/`--source`),
+short options with a glued value (`tar -Ish`, `man -Psh`), flags that throw work away or skip a confirmation
+(`git checkout -f`, `git reset --hard`, `terraform apply --auto-approve`, `pulumi up --yes`, `-y`), Windows and
+versioned program names (`Git.exe`, `npm.cmd`, `node18`), control, invisible and look-alike characters, shell
+syntax in every position, a 30-key Sybil swarm over a relay, and a million-case random mutation run checked against an
+independent, stricter statement of the rule.

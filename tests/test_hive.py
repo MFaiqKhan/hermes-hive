@@ -756,7 +756,8 @@ def test_review2_only_the_failed_command_plus_plain_flags():
     err = "datactl: error: cache index is corrupt or missing (code 17)"
     assert ok("datactl sync --rebuild-index", err, "datactl sync")
     assert ok("datactl sync --rebuild-index --retries=3 -v", err, "datactl sync")
-    assert ok("datactl sync -fv --timeout=2.5", err, "datactl sync")
+    assert ok("datactl sync -f -v --timeout=2.5", err, "datactl sync")
+    assert not ok("datactl sync -fv", err, "datactl sync")              # glued short options: `tar -Ish` is the same shape
     assert ok("datactl sync", err, "datactl sync")                              # a plain retry is the user's own
     for bad in ("datactl status --rebuild-index",            # another subcommand
                 "datactl cache rebuild --force",
