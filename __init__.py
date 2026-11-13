@@ -115,9 +115,12 @@ def _show(sig: str) -> str:
     refused = 0
     for fid, vs in by_fix.items():
         steps = json.loads(vs[0]["fix"])
-        # The hint points agents here, so text Hive would not show in a hint is not shown here either.
+        # The hint points agents here, so text Hive would not show in a hint is not shown here either. It is
+        # judged against the command that last failed with this error on this machine; when there is none,
+        # only an install the error names can pass.
+        failed = h.store.last_failed(vs[0]["sig"])
         if any(safety.screen(s, "network")[0] == "block" for s in steps) or \
-                not all(safety.network_step_allowed(s, vs[0]["error"], prog) for s in steps):
+                not all(safety.network_step_allowed(s, vs[0]["error"], failed) for s in steps):
             refused += len(vs)
             continue
         yes = sum(1 for v in vs if v["ok"] > v["fail"])
@@ -128,6 +131,9 @@ def _show(sig: str) -> str:
     if refused:
         out.append(f"\nRefused: {refused} report{'s' if refused != 1 else ''} from anonymous peers with commands in a "
                    f"shape Hive does not accept from the network (not shown).")
+        if not any(h.store.last_failed(v["sig"]) for vs in by_fix.values() for v in vs[:1]):
+            out.append("This error has not happened on this machine, so there is no failed command to compare "
+                       "them with; until it does, only installs the error names are shown.")
     return "\n".join(out)
 
 

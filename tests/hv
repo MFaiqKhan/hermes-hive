@@ -18,6 +18,8 @@ HERMES=${HERMES_BIN:-$(command -v hermes || echo "$HOME/.local/bin/hermes")}
 MODEL_URL=${MODEL_BASE_URL:-http://127.0.0.1:11435/v1}
 MODEL=${MODEL_NAME:-qwen3.5:4b}
 PORT=${HIVE_RELAY_PORT:-7447}
+BIN="$BASE/bin"   # executable copies of the demo tools: a web upload or a zip drops the executable bit
+demo_bin() { mkdir -p "$BIN"; install -m 755 "$HERE/demo/datactl" "$BIN/datactl"; }
 
 h() { local m=$1; shift; HERMES_HOME="$BASE/$m" "$HERMES" "$@" < /dev/null; }
 
@@ -40,6 +42,7 @@ case "${1:-}" in
     h A hive network share > /dev/null
     h B hive network read > /dev/null
     h B hive settings --min-peers 1 > /dev/null    # two demo machines: one other install is enough (default 2)
+    demo_bin
     echo "Ready: machine A shares fixes, machine B reads them. Relay: ws://127.0.0.1:$PORT (start it with: hv relay)";;
   fresh)
     m=${2:?name}; H="$BASE/$m"
@@ -92,8 +95,9 @@ PY
     [ -d "$BASE/$m" ] || { echo "no machine $m yet: run hv setup (A and B) or hv fresh $m"; exit 1; }
     if [ "${1:-}" = chat ]; then
       shift
+      demo_bin
       cd "$BASE/$m/shell-home"       # a neutral folder: project files (AGENTS.md ...) would become the agent's context
-      HERMES_HOME="$BASE/$m" HOME="$BASE/$m/shell-home" PATH="$HERE/demo:$PATH" \
+      HERMES_HOME="$BASE/$m" HOME="$BASE/$m/shell-home" PATH="$BIN:$PATH" \
         exec "$HERMES" chat -t terminal --reasoning none "$@"
     fi
     HERMES_HOME="$BASE/$m" exec "$HERMES" "$@";;

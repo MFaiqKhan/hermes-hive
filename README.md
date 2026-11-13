@@ -37,7 +37,8 @@ Hive fixes both halves:
 | 4 | `datactl sync` exits 0 | **learns**: that error → those steps |
 
 A plain retry that succeeds with nothing changed in between is treated as a flaky failure: nothing is learned.
-A changed variant of the failed command that succeeds (`pip install x` → `pip install --user x`) is itself the fix.
+A changed variant of the failed command that succeeds (`pip install x` → `pip install --user x`,
+`datactl sync` → `datactl sync --rebuild-index`) is itself the fix.
 If a suggested fix is applied and the same error comes back, Hive counts it as failed.
 
 `hermes hive learn` runs the same learner over your past sessions (read-only) and tells you how many of your
@@ -68,17 +69,31 @@ Hints are text. Even so, a hint is a suggestion an agent may follow, so:
   1. a known installer installing packages **named in the error** (`pip install httpx` for
      "No module named 'httpx'"; `yaml` → `pyyaml` style import names are known); never from a URL, a file or a
      non-default index;
-  2. **the program that failed, run again with other arguments** (`datactl cache rebuild --force` after
-     `datactl sync` failed), and only if that program is not an interpreter, shell or package runner, nor a
-     program whose arguments alone can run code, reach another machine or destroy files (`find`, `tar`, `ssh`,
-     `rsync`, `awk`, `sed`, `docker`, `rm`, `chmod` …), and with no code-running or server-choosing arguments
-     (`--exec`, `--to-command`, `ProxyCommand`, `git -c …`, `git config`, URLs, `!`).
+  2. **the exact command that failed on your machine, with plain flags added at the end** (`npm install` →
+     `npm install --legacy-peer-deps`, `datactl sync` → `datactl sync --rebuild-index`). The command is compared
+     token for token, so a stranger never chooses the program, the subcommand or an argument, and cannot insert,
+     remove or reorder anything. A flag is a plain switch or a long switch with a number (`--force`, `-y`,
+     `--jobs=1`); a value that could name a package, file, host or URL is not accepted (`--package=x`,
+     `--registry=x`, `--config=x`), nor is a switch that turns off a TLS, signature, sandbox or permission check.
+     This shape is never used for interpreters, shells and package runners, for programs whose flags alone can
+     run code, reach another machine or destroy files (`find`, `tar`, `ssh`, `rsync`, `awk`, `sed`, `docker`,
+     `rm`, `chmod` …), or for fetch-and-run subcommands (`exec`, `x`, `dlx`, `create`, `init`, `run`, `start`,
+     `test`, `download`, `wheel` …). For package managers and build tools (`npm`, `pnpm`, `yarn`, `go`, `cargo`,
+     `pip`, `mvn`, `gradle` …) it covers only dependency-maintenance subcommands (`install`, `ci`, `update`,
+     `cache` …), because they run project code under almost any other name.
+
+  So after an `npm`, `go`, `cargo` or `pip` failure, `npm exec <pkg>`, `pnpm dlx <pkg>`, `go run <mod>@latest`,
+  `cargo run` and `pip download <sdist>` are refused whatever the votes. A fix that changes the subcommand
+  (`datactl cache rebuild --force` after `datactl sync` failed) is still learned and used on the machine that
+  found it; it is just never shared and never accepted from others.
 
   Package names must match the error **as whole words**: `colorama` in the error does not justify
   `pip install color`.
 
-  Everything else from the network is refused: `npx x`, `uvx x`, `python -c …`, `bash ./x.sh`, paths to
-  executables, variables, `sudo`, and any shell syntax (`;`, `&&`, `|`, `$(…)`, redirects). It also needs 2+
+  Everything else from the network is refused: another program or subcommand, `npx x`, `uvx x`, `python -c …`,
+  `bash ./x.sh`, paths to executables, variables, `sudo`, and any shell syntax (`;`, `&&`, `|`, `$(…)`,
+  redirects). `hermes hive show` applies the same rule against the command that last failed with that error on
+  this machine; with no such failure it shows only installs the error names. It also needs 2+
   independent installs (`min_peers`; this install's own reports never count), more yes than no, valid signatures, proof of work (NIP-13, 16 bits by
   default) and content that matches its own hashes. Network fixes are shown as unverified text, never as an
   instruction.
@@ -139,14 +154,18 @@ the error message does not say how to fix it.
 
 | | terminal calls | result |
 |---|---|---|
-| Machine A, no hint (4 runs) | 5, 7, 8, 10 | 3 fixed, 1 gave up |
-| Machine B, Hive hint shown (every run where the error appeared: 3) | 3, 3, 3 | fixed each time: fail → hint → `datactl cache rebuild --force` → sync |
+| Machine B, labelled network text shown (6 runs, final code) | 2, 2, 3, 3, 2, 8 | fixed 6 of 6: fail → "Unverified text from 1 anonymous Nostr peer" → `datactl sync --rebuild-index` → 42 records |
+| Earlier demo tool (fix was a separate subcommand), no hint (4 runs) | 5, 7, 8, 10 | 3 fixed, 1 gave up |
+
+The no-hint row was measured before the demo tool's fix became a flag and has not been repeated with it.
 
 `hermes hive learn` on machine A's own past sessions: 80% of its failures were errors it had already fixed before.
 Hook cost: under 0.1 ms per terminal command (no network on the hot path; lookups only on a failure, cached).
 
 ## Tests
 
-`python tests/test_hive.py`: 34 offline tests, including three installs trading a fix over a local
-mock relay, poisoned fixes (wrong package, `curl | sh`) vouched for by three fake installs that are refused, and the
-exact command sequences the live model produced (pipes like `| tee` that hide a failure, `&&` chains, full tool paths).
+`python tests/test_hive.py`: 41 offline tests, including three installs trading a fix over a local
+mock relay, poisoned fixes (wrong package, `curl | sh`) vouched for by three fake installs that are refused, two
+fake peers offering `npm exec <pkg>` / `go run <mod>@latest` after an npm / go failure (nothing is shown), a table
+of fetch-and-run commands for 20+ package managers and build tools, and the exact command sequences the live model
+produced (pipes like `| tee` that hide a failure, `&&` chains, full tool paths).

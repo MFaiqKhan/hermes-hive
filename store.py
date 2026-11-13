@@ -1,6 +1,8 @@
 """Hive's local memory: one SQLite file under the plugin's data folder.
 
-antibodies  one row per (error signature, fix). ``ok``/``fail`` count what happened on THIS machine.
+antibodies  one row per (error signature, fix). ``ok``/``fail`` count what happened on THIS machine;
+            ``command`` is the command that failed (home as ~), which decides whether the fix may be shared.
+seen        the last command that failed with each error here: text from other installs is judged against it.
 votes       what other installs said about a (signature, fix): one row per remote key, newest event wins.
 outbox      fixes waiting to be shared (only when sharing is on), with the event id once published.
 hints       which hint was shown for which task, so the next command can confirm or refute it.
@@ -32,6 +34,7 @@ CREATE TABLE IF NOT EXISTS hints (
     task TEXT NOT NULL, sig TEXT NOT NULL, fix_id TEXT NOT NULL, shown_at REAL, origin TEXT,
     PRIMARY KEY (task, sig, fix_id));
 CREATE TABLE IF NOT EXISTS lookups (sig TEXT PRIMARY KEY, at REAL);
+CREATE TABLE IF NOT EXISTS seen (sig TEXT PRIMARY KEY, command TEXT, at REAL);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS votes_sig ON votes (sig);
 """
@@ -49,6 +52,8 @@ class Store:
         except sqlite3.DatabaseError:
             pass
         self.db.executescript(SCHEMA)
+        if "command" not in {r[1] for r in self.db.execute("PRAGMA table_info(antibodies)")}:
+            self.db.execute("ALTER TABLE antibodies ADD COLUMN command TEXT")     # stores from before this column
         self.db.commit()
 
     # ── helpers ──
@@ -72,15 +77,17 @@ class Store:
 
     # ── antibodies ──
     def learn(self, sig: str, fix_id: str, program: str, error: str, fix: list[str], *, source: str, os_name: str,
-              shareable: bool, share_note: str, ok: int = 1, at: Optional[float] = None) -> bool:
+              shareable: bool, share_note: str, ok: int = 1, at: Optional[float] = None,
+              command: str = "") -> bool:
         """Record a fix that worked here. Returns True when it is new."""
         at = at or time.time()
         new = not self.rows("SELECT 1 FROM antibodies WHERE sig=? AND fix_id=?", (sig, fix_id))
         self._x("""INSERT INTO antibodies(sig,fix_id,program,error,fix,ok,fail,source,os,first_seen,last_seen,
-                   shareable,share_note) VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)
-                   ON CONFLICT(sig,fix_id) DO UPDATE SET ok=ok+excluded.ok, last_seen=excluded.last_seen""",
+                   shareable,share_note,command) VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?,?)
+                   ON CONFLICT(sig,fix_id) DO UPDATE SET ok=ok+excluded.ok, last_seen=excluded.last_seen,
+                   command=COALESCE(NULLIF(antibodies.command,''), excluded.command)""",
                 (sig, fix_id, program, error, json.dumps(fix), ok, source, os_name, at, at, int(shareable),
-                 share_note))
+                 share_note, command))
         return new
 
     def outcome(self, sig: str, fix_id: str, worked: bool) -> None:
@@ -89,6 +96,17 @@ class Store:
 
     def local_fixes(self, sig: str) -> list[sqlite3.Row]:
         return self.rows("SELECT * FROM antibodies WHERE sig=? ORDER BY (ok-fail) DESC, last_seen DESC", (sig,))
+
+    def keep_private(self, sig: str, fix_id: str, note: str) -> None:
+        self._x("UPDATE antibodies SET shareable=0, share_note=? WHERE sig=? AND fix_id=?", (note, sig, fix_id))
+        self._x("DELETE FROM outbox WHERE sig=? AND fix_id=? AND published_at IS NULL", (sig, fix_id))
+
+    def saw(self, sig: str, command: str, at: Optional[float] = None) -> None:
+        self._x("INSERT OR REPLACE INTO seen(sig,command,at) VALUES(?,?,?)", (sig, command, at or time.time()))
+
+    def last_failed(self, sig: str) -> str:
+        r = self.rows("SELECT command FROM seen WHERE sig=?", (sig,))
+        return (r[0]["command"] or "") if r else ""
 
     def antibody(self, sig: str, fix_id: str) -> Optional[sqlite3.Row]:
         r = self.rows("SELECT * FROM antibodies WHERE sig=? AND fix_id=?", (sig, fix_id))
@@ -101,9 +119,10 @@ class Store:
         if sig:
             n = self._x("DELETE FROM antibodies WHERE sig LIKE ?", (sig + "%",)).rowcount
             self._x("DELETE FROM outbox WHERE sig LIKE ?", (sig + "%",))
+            self._x("DELETE FROM seen WHERE sig LIKE ?", (sig + "%",))
             return n
         n = self._x("DELETE FROM antibodies").rowcount
-        for table in ("outbox", "votes", "hints", "lookups"):
+        for table in ("outbox", "votes", "hints", "lookups", "seen"):
             self._x(f"DELETE FROM {table}")
         self.set_meta("pulled_until", 0)
         return n

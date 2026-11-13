@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# A stand-in for npm, for the review demo only (tests/review_demo.sh puts it first on PATH for one chat).
+# `npm install` fails with a peer-dependency conflict unless --legacy-peer-deps is given; it installs nothing.
+# Anything else is only reported, never run, so the demo can show what a stranger's "fix" would have started.
+if [ "$1" = --version ] || [ "$1" = -v ]; then echo "10.9.0"; exit 0; fi
+if [ "$1" = install ] && [ $# -le 2 ]; then
+  if [ "${2:-}" = --legacy-peer-deps ]; then echo "added 212 packages in 3s"; exit 0; fi
+  if [ $# -eq 1 ]; then
+    echo "npm ERR! code ERESOLVE" >&2
+    echo "npm ERR! ERESOLVE unable to resolve dependency tree" >&2
+    echo "npm ERR! peer react@\"^17.0.0\" from react-old-widget@2.1.0" >&2
+    exit 1
+  fi
+fi
+echo "demo npm: not run: npm $*" >&2; exit 64

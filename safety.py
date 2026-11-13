@@ -2,9 +2,13 @@
 
 Hive only ever shows a fix as text; it never runs anything. Still, a hint is a suggestion the agent may follow,
 so a fix that could hurt is not shown at all (BLOCK), and a risky one carries a warning (WARN). Fixes that came
-from other installs get two more rules: no downloads from non-public hosts, and a package install must be
-explained by the error itself (a "ModuleNotFoundError: httpx" justifies `pip install httpx`, not `pip install
-reqeusts`), unless many independent installs vouch for it.
+from other installs are anonymous text, and votes for them cost nothing to fake. So however many installs
+report one, it is shown only in one of two fixed shapes (`network_step_allowed`):
+
+1. a known installer installing packages the error itself names (a "ModuleNotFoundError: httpx" justifies
+   `pip install httpx`, not `pip install reqeusts`), never from a URL, file or other index;
+2. the exact command that failed on this machine, with plain flags added at the end (`npm install` ->
+   `npm install --legacy-peer-deps`). A stranger can never choose the program, the subcommand or any argument.
 """
 from __future__ import annotations
 
@@ -147,8 +151,8 @@ _RUNNERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php", "
             "dash", "ksh", "pwsh", "powershell", "npx", "pnpx", "bunx", "uvx", "pipx", "uv", "curl", "wget", "eval",
             "exec", "source", ".", "sudo", "doas", "env", "xargs", "nohup", "osascript", "cmd"}
 _SHELL_SYNTAX = re.compile(r"[;&|`<>]|\$\(|\$\{|\n")
-# Programs whose arguments alone can run code, reach other machines or destroy files: a stranger's "same program,
-# other flags" is never accepted for them.
+# Programs whose arguments alone can run code, reach other machines or destroy files: never accepted from a
+# stranger, not even as "your own command plus a flag".
 _POWERFUL = {"ssh", "scp", "sftp", "rsync", "find", "awk", "gawk", "mawk", "nawk", "sed", "make", "cmake",
              "docker", "podman", "kubectl", "helm", "systemctl", "crontab", "rm", "rmdir", "mv", "cp", "dd", "ln",
              "chmod", "chown", "chgrp", "truncate", "shred", "mount", "umount", "tee", "install", "at",
@@ -159,29 +163,100 @@ _EXEC_ARG = re.compile(r"(?i)(?:^|\s)--?(?:exec(?:dir)?|eval|command|to-command|
                        r"(?:[=\s]|$)|proxycommand|localcommand|sshcommand|\bcore\.|\balias\.|!|://|"
                        r"\bLD_PRELOAD\b|\bPYTHONPATH\b|\bNODE_OPTIONS\b")
 
+# A flag a stranger may add: a plain switch (`--force`, `--legacy-peer-deps`, `-y`, `-fdx`), or a long switch with
+# a number (`--jobs=1`, `--retries=3`). Nothing that could NAME something (a package, file, host, URL, statement:
+# `--package=evil`, `--registry=evil.example`, `--config=x.toml`, `--strict-ssl=false`), and no long word glued to
+# a single dash (`mysql -eshutdown`, `psql -cvacuum`).
+_PLAIN_FLAG = re.compile(r"--[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*(?:=\d+(?:\.\d+)*)?|-[A-Za-z0-9]{1,3}")
+# An extra screen on top of that shape, not the guarantee: switches whose name says they turn off a transport,
+# signature, sandbox or permission check, or let more code run (`--insecure`, `--no-verify`, `--nogpgcheck`,
+# `--gpgcheck=0`, `--no-sandbox`, `--allow-root`, `--unsafe-perm`, `--dangerously-allow-all-builds`).
+_WEAKENS = re.compile(r"(?i)ssl|tls|cert|verif|gpg|sign|sandbox|checksum|integrity|hash|secure|trust|auth|root|"
+                      r"priv|unsafe|allow|danger|script|downgrade|force-yes|^-k$")
+# Subcommands that fetch or run code (the list from the catalog review, plus aliases and close relatives): never
+# accepted as the subcommand of a network step, whatever the program.
+_FETCH_RUN = {"exec", "x", "dlx", "create", "init", "run", "run-script", "start", "test", "download", "wheel",
+              "stop", "restart", "t", "tst", "it", "cit", "install-test", "install-ci-test", "rum", "urn", "generate",
+              "tool", "bench", "script", "serve", "dev", "watch", "eval", "repl", "shell", "console", "publish"}
+# Package managers and build tools run code under many names (`cargo build` runs build scripts, `mvn exec:java`),
+# so for them only a short list of dependency-maintenance subcommands may be repeated with a new flag.
+_PKG_TOOLS = {"npm", "pnpm", "yarn", "bun", "corepack", "pip", "pip3", "pipenv", "poetry", "pdm", "hatch", "conda",
+              "mamba", "micromamba", "go", "cargo", "rustup", "gem", "bundle", "bundler", "composer", "dotnet",
+              "nuget", "mvn", "mvnw", "gradle", "gradlew", "ant", "sbt", "lein", "mix", "stack", "cabal", "swift",
+              "flutter", "dart", "pod", "brew", "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "snap",
+              "flatpak", "nix", "nix-env", "guix", "choco", "winget", "scoop", "just", "task", "rake", "ninja",
+              "bazel", "buck", "nx", "turbo", "lerna", "tox", "nox", "invoke", "meson", "scons"}
+_MAINTENANCE = {"install", "i", "ci", "update", "upgrade", "up", "dedupe", "prune", "audit", "outdated", "cache",
+                "fetch", "why", "list", "ls", "mod", "tidy", "sync", "lock", "restore", "vendor", "clean"}
+# yarn, pnpm and bun run a project script for any word that is not one of their own commands (`yarn build`,
+# `pnpm clean`), so for them the list is only words that are always the manager's own command.
+_SCRIPT_BY_ANY_NAME = {"yarn", "pnpm", "bun", "corepack"}
+_ALWAYS_BUILTIN = {"install", "i", "update", "upgrade", "up", "dedupe", "prune", "audit", "outdated", "cache",
+                   "fetch", "why", "list", "ls"}
 
-def network_step_allowed(step: str, error: str, failed_program: str) -> bool:
-    """True only for the two shapes a shared fix may take:
+
+def _split(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+
+def _install_shape(step: str, toks: list[str], error: str) -> bool:
+    """Shape 1: a known installer installing only packages the error names, with nothing but plain flags."""
+    if not justified_by_error(step, error) or _PKG_URL.search(step):
+        return False
+    flags = [t for t in toks if t.startswith("-")]
+    return all(_PLAIN_FLAG.fullmatch(t) and not _WEAKENS.search(t) for t in flags)
+
+
+def _own_command_plus_flags(toks: list[str], failed_command: str) -> bool:
+    """Shape 2: the tokens of the command that failed here, unchanged and in order, then only plain flags.
+
+    Nothing is inserted, removed or reordered, so a stranger cannot choose the program, the subcommand or any
+    argument, and cannot turn one of the user's own words into a flag's value or the other way round."""
+    from .signature import _strip_prefix, program as _program
+    own = _strip_prefix(_split(failed_command))
+    prog = _program(failed_command) if own else ""
+    if not own or not prog or own[0] != prog or toks[:len(own)] != own:
+        return False
+    if prog in _RUNNERS or prog in _POWERFUL:
+        return False
+    added = toks[len(own):]
+    if not all(_PLAIN_FLAG.fullmatch(t) and not _WEAKENS.search(t) for t in added):
+        return False
+    if "--" in own or "-" in own:
+        return False                     # after a bare `--` an added "flag" would be an argument
+    words = [t.lower() for t in own[1:] if not t.startswith("-")]
+    sub = words[0] if words else ""
+    if any(w in _FETCH_RUN for w in words):
+        return False                     # `npm exec x --yes`, `go -C dir run . -v`: not from a stranger
+    if prog in _PKG_TOOLS and sub not in (_ALWAYS_BUILTIN if prog in _SCRIPT_BY_ANY_NAME else _MAINTENANCE):
+        return False                     # `yarn build`, `cargo build`, `mvn exec:java`: they run code
+    return True
+
+
+def network_step_allowed(step: str, error: str, failed_command: str = "") -> bool:
+    """True only for the two shapes a fix from another install may take, however many installs report it:
+
     1. a known installer installing packages named in the error (`pip install httpx` for "No module named httpx");
-    2. the program that failed, run again with other arguments (`datactl cache rebuild --force` after
-       `datactl sync` failed), when that program is not an interpreter, shell or package runner."""
+    2. the command that failed on this machine, token for token, with plain flags added at the end
+       (`npm install --legacy-peer-deps` after `npm install` failed; `datactl sync --rebuild-index` after
+       `datactl sync` failed). Never for interpreters, shells, runners or tools whose flags alone can do harm,
+       never for fetch-and-run subcommands (`exec`, `run`, `dlx`, `create` ...), and for package managers and
+       build tools only for dependency-maintenance subcommands (`install`, `update`, `ci`, `cache` ...).
+
+    `failed_command` is the local failure as peers would write it (see `engine.network_shape`). Without it (no
+    such failure recorded on this machine) only shape 1 can pass."""
     if not step or _SHELL_SYNTAX.search(step):
         return False
-    try:
-        toks = shlex.split(step)
-    except ValueError:
-        return False
+    toks = _split(step)
     if not toks or "/" in toks[0] or re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]):
         return False
     if install_targets(step):
-        return justified_by_error(step, error) and not _PKG_URL.search(step)
-    head = toks[0]
-    from .signature import program as _program
-    prog = _program(step)
-    if not failed_program or prog != failed_program or head != prog:
+        return _install_shape(step, toks, error)
+    if _EXEC_ARG.search(step):
         return False
-    if prog in _RUNNERS or prog in _POWERFUL or _EXEC_ARG.search(step):
-        return False
-    if prog == "git" and re.search(r"(?:^|\s)(?:-c|config|submodule\s+foreach|--config-env)(?:\s|=|$)", step):
+    if toks[0] == "git" and re.search(r"(?:^|\s)(?:-c|config|submodule\s+foreach|--config-env)(?:\s|=|$)", step):
         return False                     # `git -c core.x=...` / `git config` can make git run anything
-    return True
+    return bool(failed_command) and _own_command_plus_flags(toks, failed_command)

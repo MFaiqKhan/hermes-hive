@@ -10,12 +10,15 @@ REPO=${REPO:-https://github.com/MFaiqKhan/hermes-hive}
 HERMES=${HERMES_BIN:-$HOME/.local/bin/hermes}
 PY=$(ls -d "$BASE"/A/installs/*/environments/*/venv/bin/python 2>/dev/null | head -1)
 mkdir -p "$SHOTS"; rm -f "$SHOTS"/*.png "$SHOTS"/*.txt
-TEACH='Run `datactl sync`. If it fails, run `datactl cache rebuild --force`, then run `datactl sync` again. Tell me how many records were synced.'
+BIN="$BASE/bin"   # executable copies of the demo tools: a web upload or a zip drops the executable bit
+demo_bin() { mkdir -p "$BIN"; install -m 755 "$HERE/demo/datactl" "$BIN/datactl"; }
+demo_bin
+TEACH='Run `datactl sync`. If it fails, run `datactl sync --rebuild-index`. Tell me how many records were synced.'
 ASK='Run `datactl sync` and get it working. Then tell me how many records were synced.'
 
 on() {  # on A|B <command...>: run hermes as that machine
   local m=$1; shift
-  ( cd "$BASE/$m/shell-home" && HERMES_HOME="$BASE/$m" HOME="$BASE/$m/shell-home" PATH="$HERE/demo:$PATH" \
+  ( cd "$BASE/$m/shell-home" && HERMES_HOME="$BASE/$m" HOME="$BASE/$m/shell-home" PATH="$BIN:$PATH" \
     "$@" < /dev/null 2>&1 )
 }
 shot() {  # shot NAME TITLE FILE: render

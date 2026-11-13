@@ -4,15 +4,16 @@
 #   publishes it to the local relay. B (another "machine") meets the same error and gets the fix from the hive.
 # Hermes's normal approvals stay on (no --yolo): commands Hermes considers dangerous are not run unattended.
 # Needs: a model the homes can reach (the sandbox uses qwen3.5:4b on Ollama at 127.0.0.1:11435),
-#        MAKE_HOME (script that creates a home with Hive installed and prints its path), DEMO_BIN (datactl).
+#        MAKE_HOME (script that creates a home with Hive installed and prints its path).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MAKE_HOME=${MAKE_HOME:-$HERE/make_home.sh}      # called as: make_home.sh <dir>
-DEMO_BIN=${DEMO_BIN:-$HERE/demo}
 BASE=${BASE:-/tmp/hive-demo-homes}              # the two throwaway homes go here
 PORT=${PORT:-7447}
 OUT=${OUT:-/tmp/hive-live-demo}
 mkdir -p "$OUT"
+DEMO_BIN="$OUT/bin"   # an executable copy of the demo tool: a web upload or a zip drops the executable bit
+mkdir -p "$DEMO_BIN"; install -m 755 "$HERE/demo/datactl" "$DEMO_BIN/datactl"
 PROMPT='Run `datactl sync` in the terminal and get it working. Then tell me how many records were synced.'
 
 python3 "$HERE/mock_relay.py" "$PORT" > "$OUT/relay.log" 2>&1 &

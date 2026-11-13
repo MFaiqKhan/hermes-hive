@@ -34,6 +34,8 @@ TAG = "hermes-hive"
 D_PREFIX = "hive/v1/"
 DEFAULT_RELAYS = ["wss://nos.lol", "wss://relay.primal.net", "wss://relay.damus.io"]
 OPEN_FAILURE_SECONDS = 1800
+NOT_A_SHARED_SHAPE = ("it is not a shape other installs accept (an install the error names, or the failed "
+                      "command itself with flags added)")
 MAX_STEPS = 4
 
 LOOK_AROUND = {
@@ -64,6 +66,10 @@ def _words(cmd: str) -> set[str]:
     return {w for w in re.split(r"[\s=:,]+", core_shape(cmd)) if w and not w.startswith("-")}
 
 
+def _tokens_of(cmd: str) -> set[str]:
+    return set(core_shape(cmd).split())
+
+
 def related(cmd: str, failed_cmd: str) -> str:
     """'retry' (same command), 'variant' (same program, mostly the same words) or ''."""
     if command_shape(cmd) == command_shape(failed_cmd) or (core_shape(cmd) and core_shape(cmd) == core_shape(failed_cmd)):
@@ -83,6 +89,19 @@ def failed_part(command: str, prog: str) -> str:
     if len(parts) < 2 or not prog:
         return command
     return next((p for p in reversed(parts) if program(p) == prog), command)
+
+
+def network_shape(command: str, prog: str, home: Optional[str] = None) -> str:
+    """The command that failed, written the way a fix step is written before it is shared: the failed part of a
+    list, the program by name, output plumbing dropped, the home folder as ~. A fix from another install may only
+    be this command plus flags (`safety.network_step_allowed`). "" when it is not one plain command."""
+    part = failed_part(expand_vars(command or ""), prog)
+    if not prog or len(segments(part)) != 1:
+        return ""
+    part = canonical_step(program_by_name(part, prog))
+    if re.search(r"[|<>`]|\$\(", part) or program(part) != prog:
+        return ""
+    return template_step(part, home)
 
 
 @dataclass
@@ -216,7 +235,7 @@ class Hive:
                                                  for s in f.steps for fid in f.hinted
                                                  for step in self._fix_steps(sig, fid)):
                 for fid in f.hinted:
-                    self._record_fail(sig, fid, prog, shape)
+                    self._record_fail(sig, fid, prog, shape, network_shape(f.command, prog, self.home))
                 f.hinted = []
         command = failed_part(command, prog)
         existing = next((f for f in self._open[task] if f.sig == sig), None)
@@ -224,9 +243,12 @@ class Hive:
             existing.at, existing.command = now, command
         else:
             self._open[task].append(Failure(sig, prog, shape, command, now))
+        failed = network_shape(command, prog, self.home)
+        if failed:
+            self.store.saw(sig, failed, now)          # so `hermes hive show` judges network text the same way
         if not live:
             return None
-        hint, shown = self.hint(sig, prog, shape)
+        hint, shown = self.hint(sig, prog, shape, failed)
         if shown:
             tgt = existing or self._open[task][-1]
             tgt.hinted = shown
@@ -243,7 +265,8 @@ class Hive:
             elif rel == "variant":
                 # `datactl sync` after `datactl sync --repair-index` failed: if work was done in between and this
                 # command only drops words, it is the plain retry, and the work in between is the fix
-                if f.steps and _words(command) <= _words(f.command):
+                # (a command that ADDS a flag, `datactl sync --rebuild-index`, is itself part of the fix)
+                if f.steps and _tokens_of(command) <= _tokens_of(f.command):
                     self._learn(f, f.steps, now, source=self._source)
                 else:
                     self._learn(f, f.steps + [command], now, source=self._source)
@@ -288,14 +311,14 @@ class Hive:
         if "block" in verdicts:
             return None                      # never keep a dangerous "fix", even locally
         fid = make_fix_id(steps)
+        failed = network_shape(f.command, f.program, self.home)
         checks = [shareable(s) for s in steps] + [error_shareable(f.error)]
-        if all(c[0] for c in checks) and not all(safety.network_step_allowed(s, f.error, f.program) for s in steps):
-            checks.append((False, "it is not a shape other installs accept (an install named in the error, or "
-                                  "the same program with other arguments)"))
+        if all(c[0] for c in checks) and not all(safety.network_step_allowed(s, f.error, failed) for s in steps):
+            checks.append((False, NOT_A_SHARED_SHAPE))
         ok_share = all(c[0] for c in checks)
         note = next((c[1] for c in checks if not c[0]), "")
         new = self.store.learn(f.sig, fid, f.program, f.error, steps, source=source, os_name=self.os_name,
-                               shareable=ok_share, share_note=note, at=now)
+                               shareable=ok_share, share_note=note, at=now, command=failed)
         self.stats["learned"] += 1
         if ok_share and self.settings.network == "share":
             self.store.queue(f.sig, fid)
@@ -304,23 +327,25 @@ class Hive:
         self._last_learned.append(item)
         return item
 
-    def _record_fail(self, sig: str, fid: str, prog: str, shape: str) -> None:
+    def _record_fail(self, sig: str, fid: str, prog: str, shape: str, failed: str = "") -> None:
         if self.store.antibody(sig, fid):
             self.store.outcome(sig, fid, worked=False)
         else:
             steps = self._fix_steps(sig, fid)
             if steps:
                 ok_share = (all(shareable(s)[0] for s in steps) and error_shareable(shape)[0]
-                            and all(safety.network_step_allowed(s, shape, prog) for s in steps))
+                            and all(safety.network_step_allowed(s, shape, failed) for s in steps))
                 self.store.learn(sig, fid, prog, shape, steps, source="hive", os_name=self.os_name,
-                                 shareable=ok_share, share_note="", ok=0)
+                                 shareable=ok_share, share_note="", ok=0, command=failed)
                 self.store.outcome(sig, fid, worked=False)
         if self.settings.network == "share" and self.store.antibody(sig, fid)["shareable"]:
             self.store.queue(sig, fid)
             self._kick_sync()
 
     # ── hints ──
-    def candidates(self, sig: str, error: str, prog: str = "") -> list[dict]:
+    def candidates(self, sig: str, error: str, failed: str = "") -> list[dict]:
+        """Fixes to show for an error. `failed` is the command that just failed here (`network_shape`); text
+        from other installs is judged against it."""
         out = []
         for r in self.store.local_fixes(sig):
             if r["ok"] <= r["fail"]:
@@ -350,8 +375,9 @@ class Hive:
                 if any(v[0] == "block" for v in verdicts):
                     continue
                 # Votes cost nothing to fake, so they never vouch for a shape on their own: every step must be
-                # an allowlisted shape tied to this error, however many installs report it.
-                if not all(safety.network_step_allowed(s, error, prog) for s in g["steps"]):
+                # an install the error names or this machine's own failed command plus flags, however many
+                # installs report it.
+                if not all(safety.network_step_allowed(s, error, failed) for s in g["steps"]):
                     continue
                 out.append({"fix_id": fid, "steps": g["steps"], "origin": "network", "peers": g["yes"],
                             "against": g["no"], "warn": sorted({w for v in verdicts for w in v[1]})})
@@ -359,13 +385,13 @@ class Hive:
                                 -(c.get("peers", 0) - c.get("against", 0))))
         return out[:3]
 
-    def hint(self, sig: str, prog: str, error: str) -> tuple[Optional[str], list[str]]:
+    def hint(self, sig: str, prog: str, error: str, failed: str = "") -> tuple[Optional[str], list[str]]:
         if self.settings.network != "off" and not self.store.looked_up(sig, self.settings.lookup_every):
             try:
                 self.lookup(sig, timeout=self.settings.lookup_timeout)
             except Exception:  # noqa: BLE001 - the network is a bonus; a failure never blocks the agent
                 pass
-        cands = self.candidates(sig, error, prog)
+        cands = self.candidates(sig, error, failed)
         if not cands:
             return None, []
         lines = ["", "── Hive: this error has been fixed before ──"]
@@ -486,6 +512,9 @@ class Hive:
         for row in self.store.pending()[:limit]:
             if not row["shareable"]:
                 continue
+            if not self.still_shareable(row):         # learned under an older, wider rule: it stays local
+                self.store.keep_private(row["sig"], row["fix_id"], NOT_A_SHARED_SHAPE)
+                continue
             ev = self.build_event(row)
             res = nostr.publish(self.settings.relays, ev)
             okays = [r for r, ok, _ in res if ok]
@@ -493,6 +522,11 @@ class Hive:
                 self.store.published(row["sig"], row["fix_id"], ev["id"], okays)
             results.append({"sig": row["sig"], "fix_id": row["fix_id"], "event": ev["id"], "relays": res})
         return results
+
+    def still_shareable(self, row) -> bool:
+        """A stored fix checked against today's rules: every step an install the error names, or the failed
+        command (recorded when it was learned) plus flags."""
+        return all(safety.network_step_allowed(s, row["error"], row["command"] or "") for s in json.loads(row["fix"]))
 
     def pull(self, timeout: float = 6.0) -> int:
         since = int(self.store.get_meta("pulled_until", 0) or 0)
