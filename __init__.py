@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import safety
-from .engine import DEFAULT_RELAYS, Hive
+from .engine import DEFAULT_RELAYS, INSTALL_WARNING, Hive
 
 _HIVE: Optional[Hive] = None
 
@@ -112,7 +112,7 @@ def _show(sig: str) -> str:
     for v in votes:
         if v["pubkey"] != mine:
             by_fix.setdefault(v["fix_id"], []).append(v)
-    refused = 0
+    refused = hidden = 0
     for fid, vs in by_fix.items():
         steps = json.loads(vs[0]["fix"])
         # The hint points agents here, so text Hive would not show in a hint is not shown here either. It is
@@ -125,9 +125,19 @@ def _show(sig: str) -> str:
             continue
         yes = sum(1 for v in vs if v["ok"] > v["fail"])
         no = sum(1 for v in vs if v["fail"] >= v["ok"] and v["fail"] > 0)
+        if any(safety.install_targets(s) for s in steps):
+            if h.settings.network_installs == "off":
+                hidden += len(vs)
+                continue
+            warn = [f"  ⚠ {INSTALL_WARNING}"]
+        else:
+            warn = []
         out.append(f"\nUnverified text from anonymous Nostr peers ({yes} say it works, {no} say it does not); "
                    f"check it before running anything:")
-        out += [f"    {s}" for s in steps]
+        out += [f"    {s}" for s in steps] + warn
+    if hidden:
+        out.append(f"\nHidden: {hidden} report{'s' if hidden != 1 else ''} that install packages "
+                   f"(installs from other installs are off; `hermes hive settings --network-installs on`).")
     if refused:
         out.append(f"\nRefused: {refused} report{'s' if refused != 1 else ''} from anonymous peers with commands in a "
                    f"shape Hive does not accept from the network (not shown).")
@@ -158,6 +168,8 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
     p = sub.add_parser("settings", help="Show or change network settings")
     p.add_argument("--min-peers", type=int, help="independent installs a shared fix needs before it is shown (default 2)")
     p.add_argument("--min-pow", type=int, help="proof-of-work bits required on shared fixes (default 16)")
+    p.add_argument("--network-installs", choices=["on", "off"],
+                   help="show package installs from other installs (default on; off hides them all)")
     p = sub.add_parser("forget", help="Delete learned fixes (one signature prefix, or --all)")
     p.add_argument("sig", nargs="?")
     p.add_argument("--all", action="store_true")
@@ -241,6 +253,8 @@ def _handle_cli(args: argparse.Namespace) -> int:
             h.settings.min_peers = max(1, args.min_peers)
         if args.min_pow is not None:
             h.settings.min_pow = max(0, args.min_pow)
+        if args.network_installs is not None:
+            h.settings.network_installs = args.network_installs
         h.settings.save(h.store)
         print(json.dumps({k: getattr(h.settings, k) for k in h.settings.FIELDS}, indent=2))
     elif cmd == "forget":

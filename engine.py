@@ -127,6 +127,12 @@ class Learned:
     note: str
 
 
+# Shown under every install that came from other installs (never under local fixes or flag fixes). The name is
+# the one the error asks for, but Hive cannot tell a public package from a private one with the same name.
+INSTALL_WARNING = ("this installs code from a public package registry. Check that the package name is the one "
+                   "you expect: a private or internal name could be registered publicly by someone else.")
+
+
 @dataclass
 class Settings:
     """Stored in the plugin's own SQLite file and changed with `hermes hive network|relays|settings`."""
@@ -136,8 +142,9 @@ class Settings:
     min_peers: int = 2
     lookup_timeout: float = 2.5
     lookup_every: float = 3600.0
+    network_installs: str = "on"            # on | off: show installs from other installs at all
 
-    FIELDS = ("network", "relays", "min_pow", "min_peers", "lookup_timeout", "lookup_every")
+    FIELDS = ("network", "relays", "min_pow", "min_peers", "lookup_timeout", "lookup_every", "network_installs")
 
     @classmethod
     def load(cls, store: Store) -> "Settings":
@@ -379,8 +386,12 @@ class Hive:
                 # installs report it.
                 if not all(safety.network_step_allowed(s, error, failed) for s in g["steps"]):
                     continue
+                installs = any(safety.install_targets(s) for s in g["steps"])
+                if installs and self.settings.network_installs == "off":
+                    continue
                 out.append({"fix_id": fid, "steps": g["steps"], "origin": "network", "peers": g["yes"],
-                            "against": g["no"], "warn": sorted({w for v in verdicts for w in v[1]})})
+                            "against": g["no"], "warn": sorted({w for v in verdicts for w in v[1]}),
+                            "installs": installs})
         out.sort(key=lambda c: (c["origin"] != "local", -(c.get("ok", 0) - c.get("fail", 0)),
                                 -(c.get("peers", 0) - c.get("against", 0))))
         return out[:3]
@@ -405,6 +416,8 @@ class Hive:
                 who = "1 anonymous Nostr peer" if c["peers"] == 1 else f"{c['peers']} anonymous Nostr peers"
                 lines.append(f"• Unverified text from {who}{against}; check it before running anything:")
             lines += [f"    {s}" for s in c["steps"]]
+            if c.get("installs"):
+                lines.append(f"  ⚠ {INSTALL_WARNING}")
             if c["warn"]:
                 lines.append(f"  ⚠ careful: {', '.join(c['warn'])}")
         if cands[0]["origin"] == "local":

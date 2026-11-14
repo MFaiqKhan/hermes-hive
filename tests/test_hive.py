@@ -756,8 +756,10 @@ def test_review2_only_the_failed_command_plus_plain_flags():
     err = "datactl: error: cache index is corrupt or missing (code 17)"
     assert ok("datactl sync --rebuild-index", err, "datactl sync")
     assert ok("datactl sync --rebuild-index --retries=3 -v", err, "datactl sync")
-    assert ok("datactl sync -f -v --timeout=2.5", err, "datactl sync")
-    assert not ok("datactl sync -fv", err, "datactl sync")              # glued short options: `tar -Ish` is the same shape
+    assert ok("datactl sync -q -v --timeout=2.5", err, "datactl sync")
+    assert not ok("datactl sync -qv", err, "datactl sync")              # glued short options: `tar -Ish` is the same shape
+    assert not ok("datactl sync -f", err, "datactl sync")               # force outside dependency maintenance
+    assert not ok("datactl sync --force", err, "datactl sync")
     assert ok("datactl sync", err, "datactl sync")                              # a plain retry is the user's own
     for bad in ("datactl status --rebuild-index",            # another subcommand
                 "datactl cache rebuild --force",
@@ -784,7 +786,7 @@ def test_review2_only_the_failed_command_plus_plain_flags():
         assert not ok(bad, err, "datactl sync"), bad
     # the user's own flag stays where it was, so a stranger cannot turn its value into an argument or back
     own = "tool sync --prefix ./app"
-    assert ok("tool sync --prefix ./app --force", err, own)
+    assert ok("tool sync --prefix ./app --rebuild-index", err, own)
     for bad in ("tool sync ./app", "tool sync ./app --force", "tool sync --prefix --force ./app",
                 "tool sync --force --prefix ./app", "tool sync --prefix ./other --force"):
         assert not ok(bad, err, own), bad

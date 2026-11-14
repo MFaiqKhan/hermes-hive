@@ -147,7 +147,16 @@ _IMPORT_TO_PACKAGE = {
     "serial": "pyserial", "usb": "pyusb", "crypto": "pycryptodome", "fitz": "pymupdf", "docx": "pythondocx",
     "pptx": "pythonpptx", "git": "gitpython", "telegram": "pythontelegrambot", "googleapiclient": "googleapipythonclient",
     "attr": "attrs", "zmq": "pyzmq", "ldap": "pythonldap", "mysqldb": "mysqlclient", "psycopg2": "psycopg2binary",
+    "skimage": "scikitimage", "openssl": "pyopenssl", "win32api": "pywin32", "win32con": "pywin32", "gi": "pygobject",
+    "dns": "dnspython", "nacl": "pynacl", "jose": "pythonjose", "multipart": "pythonmultipart",
+    "socketio": "pythonsocketio", "slugify": "pythonslugify", "kafka": "kafkapython",
+    "mpl_toolkits": "matplotlib", "markdown_it": "markdownitpy",
 }
+# Import names that are also the real package. Every other key above is refused as a pip name from the network:
+# `pip install yaml` for "No module named 'yaml'" installs whatever is registered as `yaml`, not PyYAML, and
+# such import-name packages are a known squatting target.
+_IMPORT_IS_PACKAGE = {"psycopg2"}
+_IMPORT_ONLY = {_norm_pkg(k) for k in _IMPORT_TO_PACKAGE} - _IMPORT_IS_PACKAGE
 
 
 def _error_words(error: str) -> set[str]:
@@ -189,7 +198,7 @@ _INSTALL_FLAGS = {
     "--legacy-peer-deps", "--force", "--global", "--ignore-scripts", "--no-audit", "--no-fund", "--dev", "--exact",
     "--optional", "--peer", "--locked", "--frozen", "--offline", "--yes", "--assume-yes",
     "--no-install-recommends", "--fix-missing", "--fix-broken", "--reinstall", "--only-upgrade", "--needed",
-    "--break-system-packages", "--cask", "--formula", "--build-from-source",
+    "--cask", "--formula", "--build-from-source",
     "-y", "-q", "-v", "-U", "-D", "-E", "-S", "-g", "-P", "-O", "-B",
 }
 
@@ -203,15 +212,17 @@ def _name_of(token: str, family: str) -> str:
     return re.split(r"[<>=!~\[@]", token, maxsplit=1)[0]
 
 
-def _named_by_error(name: str, error: str) -> bool:
+def _named_by_error(name: str, error: str, family: str = "other") -> bool:
     """A plain name must be a whole word of the error (or the known package for an import named there). A name
     with a scope or a path (`@acme/foo`, `github.com/acme/foo`, a tap) must appear in the error exactly, so
     `attacker/foo` or `evil.example/foo` never pass because the error mentions `foo`."""
     if "/" in name:
         return name.lower() in _error_tokens(error)
     words = _error_words(error)
-    mapped = {pkg for imp, pkg in _IMPORT_TO_PACKAGE.items() if imp in words}
+    mapped = {pkg for imp, pkg in _IMPORT_TO_PACKAGE.items() if _norm_pkg(imp) in words}
     n = _norm_pkg(name)
+    if family == "pip" and n in _IMPORT_ONLY:
+        return False                     # `pip install sklearn`: the import name, not scikit-learn
     return bool(n) and (n in words or n in mapped)
 
 
@@ -223,7 +234,7 @@ def justified_by_error(step: str, error: str) -> bool:
         return True
     family = _FAMILY.get(toks[0], "other")
     names = [t for t in toks[2:] if not t.startswith("-")]
-    return bool(names) and all(_NAME_SHAPES[family].fullmatch(t) and _named_by_error(_name_of(t, family), error)
+    return bool(names) and all(_NAME_SHAPES[family].fullmatch(t) and _named_by_error(_name_of(t, family), error, family)
                                for t in names)
 
 
@@ -252,7 +263,14 @@ _POWERFUL = {"ssh", "scp", "sftp", "rsync", "find", "awk", "gawk", "mawk", "nawk
              "terraform", "tofu", "terragrunt", "pulumi", "gcloud", "gsutil", "bq", "aws", "az", "ansible",
              "ansible-playbook", "flyctl", "fly", "heroku", "vercel", "netlify", "firebase", "wrangler", "gh", "glab",
              "doctl", "oc", "eksctl", "serverless", "sls", "cdk", "sam", "packer", "vagrant", "nomad", "consul",
-             "vault", "kustomize", "skaffold", "tilt", "railway", "supabase"}
+             "vault", "kustomize", "skaffold", "tilt", "railway", "supabase",
+             # programs that delete data, stop processes or change disks, users or firewalls (disk formatting,
+             # shutdown and account removal are also in BLOCK, which applies to every hint)
+             "dropdb", "dropuser", "pg_restore", "pg_ctl", "mysqladmin", "mongorestore", "wipefs", "fdisk", "fsck",
+             "sfdisk", "parted", "gdisk", "kill", "pkill", "killall", "shutdown", "reboot", "poweroff", "halt",
+             "iptables", "ip6tables", "nft", "ufw", "firewall-cmd", "userdel", "deluser", "groupdel", "usermod",
+             "passwd", "swapoff", "losetup", "cryptsetup", "zfs", "zpool", "lvremove", "vgremove", "pvremove",
+             "btrfs", "diskutil", "format", "del", "erase", "rd", "srm", "unlink"}
 # Arguments that make an ordinary program run something else or talk to a chosen server.
 _EXEC_ARG = re.compile(r"(?i)(?:^|\s)--?(?:exec(?:dir)?|eval|command|to-command|rsh|upload-pack|receive-pack|"
                        r"entrypoint|checkpoint-action|use-compress-program|run|shell|hook|plugin|preload|script)"
@@ -273,7 +291,8 @@ _WEAK_WORDS = {"ssl", "tls", "cert", "certs", "certificate", "certificates", "in
                "trusted", "untrusted", "auth", "unauthenticated", "root", "privileged", "unsafe", "allow", "allowed",
                "danger", "dangerous", "dangerously", "script", "scripts", "downgrade", "downgrades", "perm", "perms",
                "permission", "permissions", "umask", "uid", "gid", "mode", "chmod", "chown", "owner", "setuid",
-               "inspect", "inspector", "debug", "debugger", "remote", "listen", "bind", "expose", "public"}
+               "inspect", "inspector", "debug", "debugger", "remote", "listen", "bind", "expose", "public", "break",
+               "bypass", "unprotected", "unrestricted"}
 # Words for switches that throw work away or skip a confirmation that guards something destructive.
 _DESTRUCTIVE_WORDS = {"hard", "purge", "wipe", "destroy", "delete", "drop", "prune", "overwrite", "clobber",
                       "truncate", "recursive", "erase", "nuke", "discard", "yes", "approve", "noconfirm", "mirror",
@@ -293,6 +312,8 @@ def _flag_refused(flag: str, prog: str) -> bool:
         return True
     if prog == "git" and (flag in _GIT_SHORT_DESTRUCTIVE or "force" in parts):
         return True
+    if prog not in _PKG_TOOLS and ("force" in parts or flag == "-f"):
+        return True                      # `--force` outside dependency maintenance overrides the program's own guard
     return False
 
 
@@ -347,8 +368,8 @@ def _own_command_plus_flags(toks: list[str], failed_command: str) -> bool:
     if not own or not prog or own[0] != prog or toks[:len(own)] != own:
         return False
     base = base_name(prog)
-    if base in _RUNNERS or base in _POWERFUL:
-        return False
+    if base in _RUNNERS or base in _POWERFUL or base.split(".", 1)[0] in _POWERFUL:
+        return False                     # `fsck.vfat`, `wipefs.x`: the family name counts
     added = toks[len(own):]
     if not all(_PLAIN_FLAG.fullmatch(t) and not _flag_refused(t, base) for t in added):
         return False
@@ -373,7 +394,12 @@ def network_step_allowed(step: str, error: str, failed_command: str = "") -> boo
        `datactl sync` failed). Never for interpreters, shells, runners, archivers, editors, database clients,
        cloud and deploy tools or programs whose flags alone can do harm; never for fetch-and-run subcommands
        (`exec`, `run`, `dlx`, `create` ...); for package managers and build tools only for dependency-maintenance
-       subcommands; never a flag that weakens a check, destroys work or skips a confirmation.
+       subcommands; never a flag that weakens a check, destroys work or skips a confirmation, and `--force`/`-f`
+       only for package-manager dependency maintenance (`npm install --force`).
+
+    For pip, an import name that is not its package (`yaml`, `sklearn`, `cv2`) is refused: only the real package
+    (`pyyaml`, `scikit-learn`, `opencv-python`) passes. Installs still cannot be told apart from dependency
+    confusion (a private name registered publicly), so the engine labels every network install.
 
     Program names are compared by what they stand for (`npm.cmd`, `Git.exe`, `python3.12`). Text with control,
     invisible or non-plain space characters is refused. `failed_command` is the local failure as peers would write

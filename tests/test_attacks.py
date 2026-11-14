@@ -258,6 +258,90 @@ def test_a_stranger_never_adds_sudo_or_a_confirmation_skip():
     check(refused(cases), "a stranger's sudo or confirmation skip was shown")
 
 
+def test_import_names_that_are_not_the_package_are_refused_for_pip():
+    """`No module named 'yaml'` is fixed by PyYAML; whatever is registered on PyPI as `yaml` (or `sklearn`, `cv2` ...)
+    is someone else's package, and import names like these are a known squatting target."""
+    def mod(m):
+        return f"ModuleNotFoundError: No module named '{m}'"
+    bad = [(f"pip install {imp}", mod(imp), "python app.py") for imp in
+           ("yaml", "sklearn", "cv2", "PIL", "bs4", "dateutil", "dotenv", "jwt", "git", "crypto", "attr", "skimage",
+            "multipart", "jose", "nacl", "dns", "socketio", "slugify", "fitz", "docx", "magic", "serial", "telegram")]
+    bad += [("pip install yaml==6.0", mod("yaml"), ""), ("python3 -m pip install -U sklearn", mod("sklearn"), ""),
+            ("pip3 install Sklearn", mod("sklearn"), ""), ("uv pip install s_klearn", mod("sklearn"), ""),
+            ("pip install bs4 requests", "ModuleNotFoundError: No module named 'bs4' requests", "")]
+    check(refused(bad), "pip installs of an import name (not the package) were shown")
+    good = [("pip install pyyaml", mod("yaml"), ""), ("pip install scikit-learn", mod("sklearn"), ""),
+            ("pip install opencv-python", mod("cv2"), ""), ("pip install pillow", mod("PIL"), ""),
+            ("pip install beautifulsoup4", mod("bs4"), ""), ("pip install python-multipart", mod("multipart"), ""),
+            ("pip install psycopg2", mod("psycopg2"), ""), ("pip install psycopg2-binary", mod("psycopg2"), ""),
+            ("npm install yaml", "Error: Cannot find module 'yaml'", "")]      # on npm `yaml` IS the package
+    check(shown(good), "the real packages for those imports were refused")
+
+
+def test_switches_that_break_system_protection_are_refused():
+    pip_err = "error: externally-managed-environment"
+    cases = [("pip install --break-system-packages", pip_err, "pip install"),
+             ("pip install --break-system-packages foo", PYE, ""), ("pip install foo --break-system-packages", PYE, ""),
+             ("pip install --user --break-system-packages", pip_err, "pip install --user"),
+             ("npm install --bypass-checks", NODE, "npm install"),
+             ("datactl sync --unrestricted", ANY, "datactl sync")]
+    check(refused(cases), "a switch that breaks system protection was shown")
+
+
+def test_destructive_programs_and_force_outside_package_managers():
+    cases = [("dropdb app --force", ANY, "dropdb app"), ("dropdb app -i", ANY, "dropdb app"),
+             ("dropuser bob --if-exists", ANY, "dropuser bob"), ("pg_restore dump.sql --clean", ANY, "pg_restore dump.sql"),
+             ("mysqladmin drop app --force", ANY, "mysqladmin drop app"), ("kill 1234 -9", ANY, "kill 1234"),
+             ("pkill node -9", ANY, "pkill node"), ("killall node -q", ANY, "killall node"),
+             ("fsck.vfat /dev/sdb1 -y", ANY, "fsck.vfat /dev/sdb1"), ("wipefs /dev/sdb -a", ANY, "wipefs /dev/sdb"),
+             ("fdisk.x /dev/sdb -w", ANY, "fdisk.x /dev/sdb"),
+             ("ufw disable --force", ANY, "ufw disable"), ("iptables -F", ANY, "iptables"),
+             ("userdel bob -r", ANY, "userdel bob"), ("zfs destroy pool/data -r", ANY, "zfs destroy pool/data"),
+             ("shutdown now -h", ANY, "shutdown now"), ("unlink file -v", ANY, "unlink file"),
+             ("datactl sync --force", ANY, "datactl sync"), ("datactl sync -f", ANY, "datactl sync"),
+             ("datactl migrate --force-migrate", ANY, "datactl migrate"), ("prisma migrate reset --force", ANY, "prisma migrate reset"),
+             ("rails db:drop -f", ANY, "rails db:drop"), ("artisan migrate --force", ANY, "artisan migrate"),
+             ("ollama rm model --force", ANY, "ollama rm model"), ("snapctl restart --force", ANY, "snapctl restart")]
+    check(refused(cases), "a destructive program or a force switch outside dependency maintenance was shown")
+    # disk formatting, shutdown and account removal never reach a hint at all (BLOCK, local and network alike)
+    for step in ("mkfs.ext4 /dev/sdb1 -F", "shutdown now -h", "userdel bob -r", "ufw disable --force", "iptables -F"):
+        assert safety.screen(step, "network")[0] == "block", step
+    still = [("npm install --force", NODE, "npm install"), ("apt-get install -f", APT, "apt-get install"),
+             ("pip install --force-reinstall foo", PYE, ""), ("brew update --force", BREW, "brew update"),
+             ("datactl sync --rebuild-index", ANY, "datactl sync")]
+    check(shown(still), "dependency-maintenance force fixes were refused")
+
+
+def test_network_installs_carry_a_warning_and_can_be_switched_off():
+    """Dependency confusion cannot be ruled out from the name alone (a private package named in the error may be
+    registered publicly by someone else), so every install from the network says so, and users can hide them."""
+    relay, url, stop = mock_relay.start_in_thread()
+    try:
+        failed, out = "python app.py", "ModuleNotFoundError: No module named 'acme_internal_utils'"
+        sig, prog, shape = sigmod.signature(failed, out)
+        _publish(url, sig, prog, shape, ["pip install acme-internal-utils"], peers=3)
+        f2, o2 = "datactl sync", "datactl: error: cache index is corrupt or missing (code 17)"
+        sig2, prog2, shape2 = sigmod.signature(f2, o2)
+        _publish(url, sig2, prog2, shape2, ["datactl sync --rebuild-index"], peers=2)
+
+        on = _hive(network="read", relays=[url], min_pow=8, min_peers=2, lookup_timeout=4.0)
+        note = on.observe(failed, out, 1, "t")
+        assert note and "pip install acme-internal-utils" in note, note
+        assert engine.INSTALL_WARNING in note and "Suggested next step" not in note, note
+        assert engine.INSTALL_WARNING in _show(on, sig)
+        note2 = on.observe(f2, o2, 1, "t2")                        # a flag fix from the network: no install warning
+        assert note2 and "datactl sync --rebuild-index" in note2 and engine.INSTALL_WARNING not in note2, note2
+
+        off = _hive(network="read", relays=[url], min_pow=8, min_peers=2, lookup_timeout=4.0, network_installs="off")
+        assert off.observe(failed, out, 1, "t") is None
+        shown_text = _show(off, sig)
+        assert "pip install acme-internal-utils" not in shown_text and "Hidden: 3 reports" in shown_text, shown_text
+        note2 = off.observe(f2, o2, 1, "t2")                       # flag fixes still come through
+        assert note2 and "datactl sync --rebuild-index" in note2, note2
+    finally:
+        stop.set()
+
+
 # ── 4. end to end: signed events from many fake installs over a relay ────────────────────────────────────────
 
 def _hive(**settings):
